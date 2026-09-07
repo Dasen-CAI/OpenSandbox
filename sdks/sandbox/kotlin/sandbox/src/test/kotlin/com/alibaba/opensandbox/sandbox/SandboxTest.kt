@@ -356,6 +356,19 @@ class SandboxTest {
     }
 
     @Test
+    fun `checkReady timeout should not overshoot by a polling interval`() {
+        every { healthService.ping(sandboxId) } returns false
+
+        val start = System.nanoTime()
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandbox.checkReady(Duration.ofMillis(20), Duration.ofSeconds(2))
+        }
+        val elapsed = Duration.ofNanos(System.nanoTime() - start)
+
+        assertTrue(elapsed < Duration.ofMillis(500), "expected timeout in ~20ms, took ${elapsed.toMillis()}ms")
+    }
+
+    @Test
     fun `checkReady timeout should include diagnostics without network configuration hints`() {
         every { healthService.ping(sandboxId) } throws RuntimeException("connect ECONNREFUSED")
 

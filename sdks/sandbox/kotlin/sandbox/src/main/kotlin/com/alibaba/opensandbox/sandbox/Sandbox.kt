@@ -51,6 +51,7 @@ import com.alibaba.opensandbox.sandbox.internal.isCausedByInterruption
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.OffsetDateTime
+import java.util.concurrent.TimeUnit
 
 /**
  * Main entrypoint for the Open Sandbox SDK providing secure, isolated execution environments.
@@ -698,11 +699,11 @@ class Sandbox internal constructor(
     ) {
         logger.info("Waiting for sandbox {} to pass health check (timeout: {}s)", id, timeout.seconds)
 
-        val deadline = System.currentTimeMillis() + timeout.toMillis()
+        val deadline = System.nanoTime() + timeout.toNanos()
         var attempt = 0
         var lastException: Throwable? = null
 
-        while (System.currentTimeMillis() < deadline) {
+        while (System.nanoTime() < deadline) {
             attempt++
             logger.debug("Health check attempt #{} for sandbox {}", attempt, id)
 
@@ -728,7 +729,11 @@ class Sandbox internal constructor(
                 logger.debug("Health check attempt #{} returned false", attempt)
             }
 
-            Thread.sleep(pollingInterval.toMillis())
+            // Clamp the sleep to the remaining budget so the final failed check
+            // does not overshoot the timeout by a full polling interval.
+            val remainingNanos = deadline - System.nanoTime()
+            if (remainingNanos <= 0) break
+            TimeUnit.NANOSECONDS.sleep(minOf(pollingInterval.toNanos(), remainingNanos))
         }
 
         val errorDetail =
