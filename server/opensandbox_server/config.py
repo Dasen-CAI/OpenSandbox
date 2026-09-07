@@ -821,6 +821,15 @@ class EgressConfig(BaseModel):
             "(e.g. IPv4-only CNI or experimenting with IPv6 egress despite gaps)."
         ),
     )
+    otlp_endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "OTLP/HTTP endpoint (http:// or https://) where the egress sidecar exports its "
+            "OpenTelemetry metrics, injected as OTEL_EXPORTER_OTLP_ENDPOINT. "
+            "Server-side only: the collector address is infrastructure config and cannot be "
+            "set per request. When unset, sidecar metrics are not exported."
+        ),
+    )
     readiness_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -842,6 +851,18 @@ class EgressConfig(BaseModel):
             "If both are unset, the resources block is omitted (namespace LimitRange defaults may apply)."
         ),
     )
+
+    @field_validator("otlp_endpoint")
+    @classmethod
+    def validate_otlp_endpoint(cls, endpoint: Optional[str]) -> Optional[str]:
+        if not endpoint:
+            return None
+        if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+            raise ValueError(
+                "otlp_endpoint must be an http(s) URL: "
+                "the egress sidecar telemetry client only supports OTLP over HTTP"
+            )
+        return endpoint
 
     @field_validator("requests", "limits")
     @classmethod

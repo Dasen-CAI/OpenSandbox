@@ -36,6 +36,7 @@ from opensandbox_server.config import (
 from opensandbox_server.extensions import ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
+    OTEL_EXPORTER_OTLP_ENDPOINT,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
@@ -1467,6 +1468,89 @@ def test_egress_sidecar_injects_sandbox_id_env(mock_docker):
 
     sidecar_env = mock_client.api.create_container.call_args.kwargs["environment"]
     assert f"{OPENSANDBOX_EGRESS_SANDBOX_ID}=sbx-abc123" in sidecar_env
+
+
+@patch("opensandbox_server.services.docker.docker_service.docker")
+def test_egress_sidecar_injects_otlp_endpoint_env_when_configured(mock_docker):
+    """egress.otlp_endpoint is injected into the sidecar as OTEL_EXPORTER_OTLP_ENDPOINT."""
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+
+    def host_cfg_side_effect(**kwargs):
+        return kwargs
+
+    mock_client.api.create_host_config.side_effect = host_cfg_side_effect
+    mock_client.api.create_container.return_value = {"Id": "sidecar-id"}
+    mock_client.containers.get.return_value = MagicMock()
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(
+        image="egress:latest",
+        disable_ipv6=False,
+        otlp_endpoint="http://otel-collector.observability:4318",
+    )
+    service = DockerSandboxService(config=cfg)
+
+    with (
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_docker_operation") as mock_op,
+    ):
+        mock_op.return_value.__enter__.return_value = None
+        mock_op.return_value.__exit__.return_value = None
+        service._start_egress_sidecar(
+            "sbx-abc123",
+            NetworkPolicy(defaultAction="deny", egress=[]),
+            egress_token="egress-token",
+            host_execd_port=44772,
+            host_http_port=8080,
+        )
+
+    sidecar_env = mock_client.api.create_container.call_args.kwargs["environment"]
+    assert (
+        f"{OTEL_EXPORTER_OTLP_ENDPOINT}=http://otel-collector.observability:4318"
+        in sidecar_env
+    )
+
+
+@patch("opensandbox_server.services.docker.docker_service.docker")
+def test_egress_sidecar_omits_otlp_endpoint_env_when_not_configured(mock_docker):
+    """Without egress.otlp_endpoint, the sidecar env carries no OTEL_EXPORTER_OTLP_ENDPOINT."""
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+
+    def host_cfg_side_effect(**kwargs):
+        return kwargs
+
+    mock_client.api.create_host_config.side_effect = host_cfg_side_effect
+    mock_client.api.create_container.return_value = {"Id": "sidecar-id"}
+    mock_client.containers.get.return_value = MagicMock()
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.docker.network_mode = "bridge"
+    cfg.egress = EgressConfig(image="egress:latest", disable_ipv6=False)
+    service = DockerSandboxService(config=cfg)
+
+    with (
+        patch.object(service, "_ensure_image_available"),
+        patch.object(service, "_docker_operation") as mock_op,
+    ):
+        mock_op.return_value.__enter__.return_value = None
+        mock_op.return_value.__exit__.return_value = None
+        service._start_egress_sidecar(
+            "sbx-abc123",
+            NetworkPolicy(defaultAction="deny", egress=[]),
+            egress_token="egress-token",
+            host_execd_port=44772,
+            host_http_port=8080,
+        )
+
+    sidecar_env = mock_client.api.create_container.call_args.kwargs["environment"]
+    assert not any(
+        entry.startswith(f"{OTEL_EXPORTER_OTLP_ENDPOINT}=") for entry in sidecar_env
+    )
 
 
 @patch("opensandbox_server.services.docker.docker_service.docker")
