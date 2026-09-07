@@ -690,6 +690,7 @@ class Sandbox internal constructor(
      *
      * @param timeout Maximum time to wait for health check to pass
      * @param pollingInterval Time between health check attempts
+     * @throws InvalidArgumentException if pollingInterval is negative or zero
      * @throws SandboxReadyTimeoutException if health check doesn't pass within timeout
      * @throws SandboxException if health check fails
      */
@@ -697,6 +698,11 @@ class Sandbox internal constructor(
         timeout: Duration,
         pollingInterval: Duration,
     ) {
+        if (pollingInterval.isNegative || pollingInterval.isZero) {
+            throw InvalidArgumentException(
+                message = "Ready polling interval must be positive, got: $pollingInterval",
+            )
+        }
         logger.info("Waiting for sandbox {} to pass health check (timeout: {}s)", id, timeout.seconds)
 
         val deadline = System.nanoTime() + timeout.toNanos()
