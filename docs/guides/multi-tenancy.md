@@ -176,6 +176,8 @@ When the namespace quota is exhausted, `POST /v1/sandboxes` fails fast with `403
 
 The response body uses the standard `ErrorResponse` shape, and `message` carries the Kubernetes admission details, e.g. `exceeded quota: tenant-quota, requested: requests.cpu=1, used: requests.cpu=8, limited: requests.cpu=8`. SDK clients surface this as a typed error with HTTP status 403. Raise the quota or free capacity, then retry — no server restart is needed.
 
+This fail-fast contract currently applies to the `agent-sandbox` workload provider (`[kubernetes] workload_provider = "agent-sandbox"`). With the default `batchsandbox` provider, the controller does not yet propagate admission rejections onto the CR status, so quota exhaustion still waits for the sandbox creation timeout and returns `KUBERNETES::POD_READY_TIMEOUT`.
+
 ### 3. LimitRange (recommended)
 
 ```yaml

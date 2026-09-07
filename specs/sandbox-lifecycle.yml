@@ -292,6 +292,10 @@ paths:
 
             The returned `ErrorResponse.code` is `KUBERNETES::QUOTA_EXCEEDED` and
             `message` carries the Kubernetes admission rejection details.
+
+            This fail-fast behavior applies when the `agent-sandbox` workload
+            provider is used. With the default `batchsandbox` provider, quota
+            exhaustion currently waits for the sandbox creation timeout.
           content:
             application/json:
               schema:
