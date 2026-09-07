@@ -156,6 +156,8 @@ curl -H "OPEN-SANDBOX-API-KEY: your-secret-api-key" http://localhost:8080/v1/san
 
 ### Example Usage
 
+Docker requires positive `resourceLimits.cpu` and `resourceLimits.memory` values; `gpu` accepts a positive integer or `all`. Invalid values return HTTP 400 (`INVALID_PARAMETER`) before volume creation or image pulls. Correct previously ignored values or omit the key to leave that limit unset.
+
 **Create a Sandbox**
 
 ```bash

@@ -664,6 +664,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         )
         self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
+        resource_limits = self._resolve_resource_limits(request)
         self._validate_network_exists()
 
         try:
@@ -685,7 +686,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         def _run() -> None:
             try:
                 result = self._provision_sandbox(
-                    sandbox_id, request, created_at, expires_at,
+                    sandbox_id, request, created_at, expires_at, resource_limits,
                     pvc_inspect_cache, auto_created_volumes,
                     sandbox_env=sandbox_env, egress_env=egress_env,
                 )
@@ -714,6 +715,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         request: CreateSandboxRequest,
         created_at: datetime,
         expires_at: Optional[datetime],
+        resource_limits: tuple[Optional[int], Optional[int], Optional[int]],
         pvc_inspect_cache: Optional[dict[str, dict]] = None,
         auto_created_volumes: Optional[list[str]] = None,
         sandbox_env: Optional[Dict[str, Optional[str]]] = None,
@@ -728,7 +730,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 auto_created_volumes, separators=(",", ":"),
             )
         image_uri, auth_config = self._resolve_image_auth(request, sandbox_id)
-        mem_limit, nano_cpus, gpu_count = self._resolve_resource_limits(request)
+        mem_limit, nano_cpus, gpu_count = resource_limits
         egress_token: Optional[str] = None
         requested_windows_profile = is_windows_platform(request.platform)
 

@@ -245,8 +245,18 @@ async def test_create_sandbox_applies_config_sandbox_env_and_binds(mock_docker):
     assert binds == ["/opt/certs/root-ca.crt:/etc/ssl/private-ca/root-ca.crt:ro"]
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits, memory, cpu, gpu",
+    [
+        ({"gpu": "2"}, None, None, 2),
+        ({"memory": "512Mi", "cpu": "500m", "gpu": "all"}, 512 * 1024**2, 500_000_000, -1),
+        ({"memory": "1G", "cpu": "1.5"}, 1_000_000_000, 1_500_000_000, None),
+        ({}, None, None, None),
+        ({"disk": "custom-value"}, None, None, None),
+    ],
+)
 @patch("opensandbox_server.services.docker.docker_service.docker")
-async def test_create_sandbox_passes_gpu_device_requests(mock_docker):
+async def test_create_sandbox_applies_resource_limits(mock_docker, limits, memory, cpu, gpu):
     mock_client = MagicMock()
     mock_client.containers.list.return_value = []
     mock_client.api.create_container.return_value = {"Id": "cid"}
@@ -257,7 +267,7 @@ async def test_create_sandbox_passes_gpu_device_requests(mock_docker):
     request = CreateSandboxRequest(
         image=ImageSpec(uri="python:3.11"),
         timeout=120,
-        resourceLimits=ResourceLimits(root={"gpu": "2"}),
+        resourceLimits=ResourceLimits(root=limits),
         env={},
         metadata={},
         entrypoint=["python"],
@@ -277,13 +287,69 @@ async def test_create_sandbox_passes_gpu_device_requests(mock_docker):
         await service.create_sandbox(request)
 
     create_host_config_kwargs = mock_client.api.create_host_config.call_args.kwargs
+    for key, expected in (("mem_limit", memory), ("nano_cpus", cpu)):
+        if expected is None:
+            assert key not in create_host_config_kwargs
+        else:
+            assert create_host_config_kwargs[key] == expected
     device_requests = create_host_config_kwargs.get("device_requests")
+    if gpu is None:
+        assert "device_requests" not in create_host_config_kwargs
+        return
     assert device_requests is not None
     assert len(device_requests) == 1
     # DeviceRequest is a dict subclass keyed with the Docker Engine's
     # capitalized field names.
-    assert device_requests[0]["Count"] == 2
+    assert device_requests[0]["Count"] == gpu
     assert device_requests[0]["Capabilities"] == [["gpu"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key, value",
+    [(key, value) for key in ("memory", "cpu", "gpu") for value in ("", " ", "0", "-1", "invalid")]
+    + [("memory", "0Mi"), ("memory", "9" * 5000)]
+    + [("cpu", value) for value in ("nan", "inf", "-inf", "1e10", "1e308", "1e309", "0.0000000001")]
+    + [("gpu", "1.5")]
+    + [(key, "x" * 5000) for key in ("cpu", "gpu")],
+    ids=lambda value: value if len(value) < 80 else "oversized-integer",
+)
+@patch("opensandbox_server.services.docker.docker_service.docker")
+async def test_create_sandbox_rejects_invalid_resource_limits_before_side_effects(mock_docker, key, value):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_docker.from_env.return_value = mock_client
+    service = DockerSandboxService(config=_app_config())
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="python:3.11"),
+        resourceLimits=ResourceLimits(root={key: value}),
+        entrypoint=["python"],
+    )
+    with (
+        patch.object(service, "_validate_volumes") as validate_volumes,
+        patch.object(service, "_ensure_image_available") as ensure_image,
+        patch.object(service, "_create_and_start_container") as create_container,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await service.create_sandbox(request)
+
+    assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+    assert f"resourceLimits.{key}" in exc_info.value.detail["message"]
+    message = exc_info.value.detail["message"]
+    if len(value) > 80:
+        assert len(message) < 250
+        assert repr(value) not in message
+        assert value[:80] in message
+        assert f"{len(value)} characters" in message
+    else:
+        assert repr(value) in message
+    validate_volumes.assert_not_called()
+    ensure_image.assert_not_called()
+    create_container.assert_not_called()
+    mock_client.volumes.create.assert_not_called()
+    mock_client.api.create_container.assert_not_called()
+
 
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker_service.docker")
