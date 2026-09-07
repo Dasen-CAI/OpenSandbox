@@ -167,6 +167,15 @@ spec:
     pods: "20"
 ```
 
+#### Quota exhaustion behavior
+
+When the namespace quota is exhausted, `POST /v1/sandboxes` fails fast with `403 KUBERNETES::QUOTA_EXCEEDED` instead of waiting for the sandbox-creation timeout and returning `KUBERNETES::POD_READY_TIMEOUT`:
+
+- **Count quotas** (`count/sandboxes.agents.x-k8s.io`): the Sandbox create is rejected by Kubernetes admission immediately.
+- **Compute quotas** (`requests.cpu`, `requests.memory`, `pods`): the Sandbox is created, but its Pod cannot be admitted; the server surfaces the rejection from the workload status (`ReconcilerError`) as soon as the controller records it (typically within a second).
+
+The response body uses the standard `ErrorResponse` shape, and `message` carries the Kubernetes admission details, e.g. `exceeded quota: tenant-quota, requested: requests.cpu=1, used: requests.cpu=8, limited: requests.cpu=8`. SDK clients surface this as a typed error with HTTP status 403. Raise the quota or free capacity, then retry — no server restart is needed.
+
 ### 3. LimitRange (recommended)
 
 ```yaml
