@@ -147,9 +147,9 @@ class CodeInterpreter internal constructor(
      *
      * Healthy means both:
      * - the code execution service (execd) answers `GET /ping`; and
-     * - the code interpreter runtime process (Jupyter kernel gateway) is running
-     *   inside the sandbox, verified by executing a process-check script through
-     *   the execd command API.
+     * - the code interpreter runtime (Jupyter kernel gateway) is serving inside
+     *   the sandbox, verified by probing its listen port through the execd
+     *   command API.
      *
      * Exceptions raised by either leg are treated as unhealthy.
      *
@@ -157,15 +157,15 @@ class CodeInterpreter internal constructor(
      */
     fun isHealthy(): Boolean =
         try {
-            ping() && isRuntimeProcessAlive()
+            ping() && isRuntimeServing()
         } catch (e: Exception) {
             logger.debug("Health check failed for code interpreter {}: {}", id, e.message)
             false
         }
 
-    private fun isRuntimeProcessAlive(): Boolean =
+    private fun isRuntimeServing(): Boolean =
         try {
-            sandbox.commands().run(RUNTIME_PROCESS_CHECK_COMMAND).error == null
+            sandbox.commands().run(RUNTIME_CHECK_COMMAND).error == null
         } catch (e: Exception) {
             logger.debug("Runtime process check failed for code interpreter {}: {}", id, e.message)
             false
@@ -237,13 +237,16 @@ class CodeInterpreter internal constructor(
         internal val DEFAULT_HEALTH_CHECK_POLLING_INTERVAL: Duration = Duration.ofMillis(200)
 
         /**
-         * Strict health check script: verifies the code interpreter runtime process
-         * (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
-         * `/ping` before the entrypoint launches Jupyter, so a daemon ping alone cannot
-         * prove the runtime is ready. The command exits 0 when the process is found.
+         * Strict health check script: verifies the code interpreter runtime (Jupyter
+         * kernel gateway) is actually serving inside the sandbox. execd starts serving
+         * `/ping` before the entrypoint launches Jupyter, and the setup stage may run
+         * short-lived "jupyter kernelspec" helpers, so a daemon ping or a process-name
+         * grep cannot prove the runtime is ready. Probing the Jupyter listen port
+         * (127.0.0.1:${'$'}{JUPYTER_PORT:-44771}, same default as the entrypoint) only
+         * passes once the server accepts connections.
          */
-        internal const val RUNTIME_PROCESS_CHECK_COMMAND =
-            "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1"
+        internal const val RUNTIME_CHECK_COMMAND =
+            "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${'$'}{JUPYTER_PORT:-44771}' && exit 0 || exit 1"
 
         /**
          * Creates a new [Builder] for creating CodeInterpreter instances.
@@ -261,9 +264,9 @@ class CodeInterpreter internal constructor(
          *
          * By default a strict health check runs before the interpreter is returned:
          * the code execution service (execd) must answer `GET /ping` AND the code
-         * interpreter runtime process (Jupyter kernel gateway) must be running inside
-         * the sandbox, both within [Builder.readyTimeout]. execd starts serving before
-         * the runtime process launches, so the daemon ping alone is not enough.
+         * interpreter runtime (Jupyter kernel gateway) must be serving, both within
+         * [Builder.readyTimeout]. execd starts serving before the runtime launches,
+         * so the daemon ping alone is not enough.
          * Opt out via [Builder.skipHealthCheck].
          *
          * This internal method handles the creation and initialization of CodeInterpreter

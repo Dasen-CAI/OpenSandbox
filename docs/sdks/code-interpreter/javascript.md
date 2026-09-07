@@ -91,9 +91,10 @@ await sandbox.close();
 expires. An attempt is healthy only when both conditions pass:
 
 - execd answers `GET /ping` on the interpreter's own endpoint.
-- The interpreter runtime (Jupyter kernel gateway) is running inside the sandbox,
-  verified by executing a process-check script (`ps aux | grep jupyter`) through the
-  execd command API.
+- The interpreter runtime (Jupyter kernel gateway) is serving inside the sandbox,
+  verified by probing its listen port (`127.0.0.1:44771`, overridable via `JUPYTER_PORT`)
+  through the execd command API. The port probe cannot be satisfied by short-lived
+  `jupyter kernelspec` setup helpers, and only passes once the server accepts connections.
 
 The runtime check is required because execd serves `/ping` before the sandbox entrypoint
 launches Jupyter. The check applies regardless of the wrapped sandbox's readiness

@@ -21,6 +21,7 @@ using OpenSandbox.CodeInterpreter.Services;
 using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
+using OpenSandbox.Services;
 using Microsoft.Extensions.Logging;
 
 namespace OpenSandbox.CodeInterpreter.Adapters;
@@ -28,7 +29,7 @@ namespace OpenSandbox.CodeInterpreter.Adapters;
 /// <summary>
 /// Adapter implementation for the codes service.
 /// </summary>
-internal sealed class CodesAdapter : ICodes
+internal sealed class CodesAdapter : ICodes, IExecdHealth
 {
     private readonly HttpClientWrapper _client;
     private readonly HttpClient _sseHttpClient;
@@ -169,8 +170,7 @@ internal sealed class CodesAdapter : ICodes
         }
     }
 
-    public async IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(
-        RunCodeRequest request,
+    public async IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(        RunCodeRequest request,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (request == null)

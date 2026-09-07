@@ -38,12 +38,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_READY_TIMEOUT = timedelta(seconds=30)
 DEFAULT_HEALTH_CHECK_POLLING_INTERVAL = timedelta(milliseconds=200)
 
-# Strict health check script: verifies the code interpreter runtime process
-# (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
-# /ping before the entrypoint launches Jupyter, so a daemon ping alone cannot
-# prove the runtime is ready. The command exits 0 when the process is found.
+# Strict health check script: verifies the code interpreter runtime (Jupyter
+# kernel gateway) is actually serving inside the sandbox. execd starts serving
+# /ping before the entrypoint launches Jupyter, and the setup stage may run
+# short-lived "jupyter kernelspec" helpers, so a daemon ping or a process-name
+# grep cannot prove the runtime is ready. Probing the Jupyter listen port
+# (127.0.0.1:${JUPYTER_PORT:-44771}, same default as the entrypoint) only
+# passes once the server accepts connections.
 RUNTIME_PROCESS_CHECK_COMMAND = (
-    "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1"
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${JUPYTER_PORT:-44771}' "
+    "&& exit 0 || exit 1"
 )
 
 
@@ -176,9 +180,9 @@ class CodeInterpreterSync:
         Healthy means both:
 
         - the code execution service (execd) answers ``GET /ping``; and
-        - the code interpreter runtime process (Jupyter kernel gateway) is
-          running inside the sandbox, verified by executing a process-check
-          script through the execd command API.
+        - the code interpreter runtime (Jupyter kernel gateway) is serving
+          inside the sandbox, verified by probing its listen port through the
+          execd command API.
 
         Exceptions raised by either leg are treated as unhealthy.
 
@@ -192,7 +196,7 @@ class CodeInterpreterSync:
 
     def _is_runtime_process_alive(self) -> bool:
         """
-        Check if the code interpreter runtime process (Jupyter) is running.
+        Check if the code interpreter runtime (Jupyter) is serving.
         """
         try:
             execution = self._sandbox.commands.run(RUNTIME_PROCESS_CHECK_COMMAND)

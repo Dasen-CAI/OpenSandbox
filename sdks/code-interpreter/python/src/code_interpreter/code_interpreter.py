@@ -42,12 +42,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_READY_TIMEOUT = timedelta(seconds=30)
 DEFAULT_HEALTH_CHECK_POLLING_INTERVAL = timedelta(milliseconds=200)
 
-# Strict health check script: verifies the code interpreter runtime process
-# (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
-# /ping before the entrypoint launches Jupyter, so a daemon ping alone cannot
-# prove the runtime is ready. The command exits 0 when the process is found.
+# Strict health check script: verifies the code interpreter runtime (Jupyter
+# kernel gateway) is actually serving inside the sandbox. execd starts serving
+# /ping before the entrypoint launches Jupyter, and the setup stage may run
+# short-lived "jupyter kernelspec" helpers, so a daemon ping or a process-name
+# grep cannot prove the runtime is ready. Probing the Jupyter listen port
+# (127.0.0.1:${JUPYTER_PORT:-44771}, same default as the entrypoint) only
+# passes once the server accepts connections.
 RUNTIME_PROCESS_CHECK_COMMAND = (
-    "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1"
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${JUPYTER_PORT:-44771}' "
+    "&& exit 0 || exit 1"
 )
 
 
@@ -200,9 +204,9 @@ class CodeInterpreter:
         Healthy means both:
 
         - the code execution service (execd) answers ``GET /ping``; and
-        - the code interpreter runtime process (Jupyter kernel gateway) is
-          running inside the sandbox, verified by executing a process-check
-          script through the execd command API.
+        - the code interpreter runtime (Jupyter kernel gateway) is serving
+          inside the sandbox, verified by probing its listen port through the
+          execd command API.
 
         Exceptions raised by either leg are treated as unhealthy.
 
@@ -216,9 +220,9 @@ class CodeInterpreter:
 
     async def _is_runtime_process_alive(self) -> bool:
         """
-        Check if the code interpreter runtime process (Jupyter) is running.
+        Check if the code interpreter runtime (Jupyter) is serving.
 
-        Runs the process-check script through the sandbox command service and
+        Probes the runtime listen port through the sandbox command service and
         treats a failed command (non-zero exit surfaced as an execution error)
         as an unhealthy runtime.
         """
@@ -287,10 +291,10 @@ class CodeInterpreter:
 
         By default a strict health check runs before the interpreter is returned:
         the code execution service (execd) must answer ``GET /ping`` AND the
-        code interpreter runtime process (Jupyter kernel gateway) must be
-        running inside the sandbox, both within ``ready_timeout``. execd starts
-        serving before the runtime process launches, so the daemon ping alone
-        is not enough. Set ``skip_health_check=True`` to opt out.
+        code interpreter runtime (Jupyter kernel gateway) must be serving,
+        both within ``ready_timeout``. execd starts serving before the runtime
+        launches, so the daemon ping alone is not enough. Set
+        ``skip_health_check=True`` to opt out.
 
         CodeInterpreter must be created by wrapping an existing Sandbox instance with
         code execution capabilities. This design ensures clear separation of concerns:

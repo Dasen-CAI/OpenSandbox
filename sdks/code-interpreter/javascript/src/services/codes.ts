@@ -48,11 +48,11 @@ export interface Codes {
   interrupt(contextId: string): Promise<void>;
 
   /**
-   * Check if the code execution service (execd) is responsive.
+   * Optional execd daemon ping capability.
    *
-   * The ping targets the execd daemon endpoint used by this service
-   * (`GET /ping`). It does not verify that a specific language runtime is
-   * ready, only that the daemon serving code execution requests is responsive.
+   * Implemented by the default adapter; custom adapters may omit it, in which
+   * case the interpreter falls back to probing execd `/ping` directly from the
+   * sandbox connection config.
    */
-  ping(signal?: AbortSignal): Promise<boolean>;
+  ping?(signal?: AbortSignal): Promise<boolean>;
 }

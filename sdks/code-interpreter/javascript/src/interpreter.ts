@@ -18,6 +18,7 @@ import {
   DEFAULT_READY_TIMEOUT_SECONDS,
   SandboxReadyTimeoutException,
 } from "@alibaba-group/opensandbox";
+import { createExecdClient } from "@alibaba-group/opensandbox/internal";
 import type { Sandbox } from "@alibaba-group/opensandbox";
 
 import { createDefaultAdapterFactory } from "./factory/defaultAdapterFactory.js";
@@ -46,13 +47,16 @@ export interface CodeInterpreterCreateOptions {
 }
 
 /**
- * Strict health check script: verifies the code interpreter runtime process
- * (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
- * /ping before the entrypoint launches Jupyter, so a daemon ping alone cannot
- * prove the runtime is ready. The command exits 0 when the process is found.
+ * Strict health check script: verifies the code interpreter runtime (Jupyter
+ * kernel gateway) is actually serving inside the sandbox. execd starts serving
+ * /ping before the entrypoint launches Jupyter, and the setup stage may run
+ * short-lived "jupyter kernelspec" helpers, so a daemon ping or a process-name
+ * grep cannot prove the runtime is ready. Probing the Jupyter listen port
+ * (127.0.0.1:${JUPYTER_PORT:-44771}, same default as the entrypoint) only
+ * passes once the server accepts connections.
  */
-const RUNTIME_PROCESS_CHECK_COMMAND =
-  "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1";
+const RUNTIME_CHECK_COMMAND =
+  "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${JUPYTER_PORT:-44771}' && exit 0 || exit 1";
 
 function throwIfAborted(signal?: AbortSignal): void {
   signal?.throwIfAborted();
@@ -89,11 +93,14 @@ export class CodeInterpreter {
   private constructor(
     readonly sandbox: Sandbox,
     readonly codes: Codes,
+    private readonly execdBaseUrl: string,
+    private readonly execdHeaders: Record<string, string> | undefined,
   ) {}
 
   static async create(sandbox: Sandbox, opts: CodeInterpreterCreateOptions = {}): Promise<CodeInterpreter> {
     const endpoint = await sandbox.getEndpoint(DEFAULT_EXECD_PORT);
     const execdBaseUrl = `${sandbox.connectionConfig.protocol}://${endpoint.endpoint}`;
+    const execdHeaders = endpoint.headers;
     const adapterFactory = opts.adapterFactory ?? createDefaultAdapterFactory();
     const codes = adapterFactory.createCodes({
       sandbox,
@@ -101,7 +108,7 @@ export class CodeInterpreter {
       endpointHeaders: endpoint.headers,
     });
 
-    const interpreter = new CodeInterpreter(sandbox, codes);
+    const interpreter = new CodeInterpreter(sandbox, codes, execdBaseUrl, execdHeaders);
 
     if (!(opts.skipHealthCheck ?? false)) {
       await interpreter.waitUntilReady({
@@ -132,31 +139,57 @@ export class CodeInterpreter {
   }
 
   /**
+   * Ping the execd daemon on the interpreter's own endpoint.
+   *
+   * Prefers the codes service's optional `ping` capability; custom adapters
+   * that do not implement it fall back to a direct execd probe built from the
+   * sandbox connection config.
+   */
+  private async pingExecd(signal?: AbortSignal): Promise<boolean> {
+    if (typeof this.codes.ping === "function") {
+      return await this.codes.ping(signal);
+    }
+    const { error } = await this.execdPingClient().GET("/ping", {
+      parseAs: "text",
+      signal,
+    });
+    return error == null;
+  }
+
+  private execdPingClient() {
+    return createExecdClient({
+      baseUrl: this.execdBaseUrl,
+      headers: this.execdHeaders ?? {},
+      fetch: this.sandbox.connectionConfig.fetch,
+    });
+  }
+
+  /**
    * Check if the code interpreter is healthy (strict check).
    *
    * Healthy means both:
    * - the code execution service (execd) answers `GET /ping`; and
-   * - the code interpreter runtime process (Jupyter kernel gateway) is running
-   *   inside the sandbox, verified by executing a process-check script through
-   *   the execd command API.
+   * - the code interpreter runtime (Jupyter kernel gateway) is serving
+   *   inside the sandbox, verified by probing its listen port through the
+   *   execd command API.
    *
    * Exceptions from either leg are treated as unhealthy.
    */
   async isHealthy(signal?: AbortSignal): Promise<boolean> {
     try {
-      if (!(await this.codes.ping(signal))) {
+      if (!(await this.pingExecd(signal))) {
         return false;
       }
-      return await this.isRuntimeProcessAlive(signal);
+      return await this.isRuntimeServing(signal);
     } catch {
       return false;
     }
   }
 
-  private async isRuntimeProcessAlive(signal?: AbortSignal): Promise<boolean> {
+  private async isRuntimeServing(signal?: AbortSignal): Promise<boolean> {
     try {
       const execution = await this.sandbox.commands.run(
-        RUNTIME_PROCESS_CHECK_COMMAND,
+        RUNTIME_CHECK_COMMAND,
         undefined,
         undefined,
         signal,

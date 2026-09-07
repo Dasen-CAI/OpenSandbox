@@ -47,7 +47,7 @@ public class CodeInterpreterHealthCheckTests
         Assert.Equal(5, codes.PingAttempts);
         commands.Verify(
             x => x.RunAsync(
-                CodeInterpreterHealthCheck.RuntimeProcessCheckCommand,
+                CodeInterpreterHealthCheck.RuntimeCheckCommand,
                 It.IsAny<RunCommandOptions?>(),
                 It.IsAny<ExecutionHandlers?>(),
                 It.IsAny<CancellationToken>()),
@@ -108,7 +108,7 @@ public class CodeInterpreterHealthCheckTests
         Assert.True(await interpreter.IsHealthyAsync());
         commands.Verify(
             x => x.RunAsync(
-                CodeInterpreterHealthCheck.RuntimeProcessCheckCommand,
+                CodeInterpreterHealthCheck.RuntimeCheckCommand,
                 It.IsAny<RunCommandOptions?>(),
                 It.IsAny<ExecutionHandlers?>(),
                 It.IsAny<CancellationToken>()),
@@ -244,7 +244,7 @@ public class CodeInterpreterHealthCheckTests
         }
     }
 
-    private sealed class FakeCodes : ICodes
+    private sealed class FakeCodes : ICodes, IExecdHealth
     {
         private readonly int _pingSucceedsAfter;
 

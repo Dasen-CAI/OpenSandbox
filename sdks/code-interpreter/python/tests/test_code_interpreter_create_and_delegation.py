@@ -161,7 +161,8 @@ async def test_create_runs_runtime_process_check_script(monkeypatch) -> None:
         RUNTIME_PROCESS_CHECK_COMMAND,
         RUNTIME_PROCESS_CHECK_COMMAND,
     ]
-    assert "grep jupyter" in sbx.commands.commands[0]
+    assert "/dev/tcp/127.0.0.1/" in sbx.commands.commands[0]
+    assert "${JUPYTER_PORT:-44771}" in sbx.commands.commands[0]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ using OpenSandbox.CodeInterpreter.Factory;
 using OpenSandbox.CodeInterpreter.Services;
 using OpenSandbox.Config;
 using OpenSandbox.Core;
+using OpenSandbox.Internal;
 using OpenSandbox.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -24,18 +25,21 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace OpenSandbox.CodeInterpreter;
 
 /// <summary>
-/// Strict health check script: verifies the code interpreter runtime process
-/// (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
-/// <c>/ping</c> before the entrypoint launches Jupyter, so a daemon ping alone
-/// cannot prove the runtime is ready. The command exits 0 when the process is found.
+/// Strict health check helpers for code interpreters.
 /// </summary>
 public static class CodeInterpreterHealthCheck
 {
     /// <summary>
-    /// The shell command run inside the sandbox to detect the interpreter runtime process.
+    /// The shell command run inside the sandbox to verify the interpreter runtime
+    /// (Jupyter kernel gateway) is actually serving. execd starts serving
+    /// <c>/ping</c> before the entrypoint launches Jupyter, and the setup stage may
+    /// run short-lived "jupyter kernelspec" helpers, so a daemon ping or a
+    /// process-name grep cannot prove the runtime is ready. Probing the Jupyter
+    /// listen port (127.0.0.1:${JUPYTER_PORT:-44771}, same default as the entrypoint)
+    /// only passes once the server accepts connections.
     /// </summary>
-    public const string RuntimeProcessCheckCommand =
-        "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1";
+    public const string RuntimeCheckCommand =
+        "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${JUPYTER_PORT:-44771}' && exit 0 || exit 1";
 }
 
 /// <summary>
@@ -131,12 +135,14 @@ public sealed class CodeInterpreter
     public IExecdMetrics Metrics => Sandbox.Metrics;
 
     private readonly ILogger _logger;
+    private readonly HttpClientWrapper? _fallbackExecdClient;
 
-    private CodeInterpreter(Sandbox sandbox, ICodes codes, ILogger logger)
+    private CodeInterpreter(Sandbox sandbox, ICodes codes, ILogger logger, HttpClientWrapper? fallbackExecdClient = null)
     {
         Sandbox = sandbox ?? throw new ArgumentNullException(nameof(sandbox));
         Codes = codes ?? throw new ArgumentNullException(nameof(codes));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _fallbackExecdClient = fallbackExecdClient;
         _logger.LogDebug("Code interpreter initialized for sandbox: {SandboxId}", sandbox.Id);
     }
 
@@ -146,9 +152,9 @@ public sealed class CodeInterpreter
     /// <remarks>
     /// By default a strict health check runs before the interpreter is returned: the code
     /// execution service (execd) must answer <c>GET /ping</c> AND the code interpreter
-    /// runtime process (Jupyter kernel gateway) must be running inside the sandbox, both
-    /// within <see cref="CodeInterpreterCreateOptions.ReadyTimeoutSeconds"/>. execd starts
-    /// serving before the runtime process launches, so the daemon ping alone is not enough.
+    /// runtime (Jupyter kernel gateway) must be serving, both within
+    /// <see cref="CodeInterpreterCreateOptions.ReadyTimeoutSeconds"/>. execd starts
+    /// serving before the runtime launches, so the daemon ping alone is not enough.
     /// Set <see cref="CodeInterpreterCreateOptions.SkipHealthCheck"/> to opt out.
     /// </remarks>
     /// <param name="sandbox">The sandbox to wrap.</param>
@@ -186,7 +192,15 @@ public sealed class CodeInterpreter
             LoggerFactory = loggerFactory
         });
 
-        var interpreter = new CodeInterpreter(sandbox, codes, logger);
+        // Fallback execd probe for custom codes adapters that do not implement
+        // IExecdHealth; shares the sandbox's HTTP client.
+        var fallbackExecdClient = new HttpClientWrapper(
+            sandbox.SharedHttpClientProvider.HttpClient,
+            execdBaseUrl,
+            execdHeaders,
+            loggerFactory.CreateLogger("OpenSandbox.CodeInterpreter.HttpClientWrapper"));
+
+        var interpreter = new CodeInterpreter(sandbox, codes, logger, fallbackExecdClient);
 
         if (!(options?.SkipHealthCheck ?? false))
         {
@@ -207,8 +221,8 @@ public sealed class CodeInterpreter
     /// Healthy means both:
     /// <list type="bullet">
     /// <item>the code execution service (execd) answers <c>GET /ping</c>; and</item>
-    /// <item>the code interpreter runtime process (Jupyter kernel gateway) is running
-    /// inside the sandbox, verified by executing a process-check script through the
+    /// <item>the code interpreter runtime (Jupyter kernel gateway) is serving
+    /// inside the sandbox, verified by probing its listen port through the
     /// execd command API.</item>
     /// </list>
     /// Exceptions from either leg are treated as unhealthy.
@@ -219,12 +233,12 @@ public sealed class CodeInterpreter
     {
         try
         {
-            if (!await Codes.PingAsync(cancellationToken).ConfigureAwait(false))
+            if (!await PingExecdAsync(cancellationToken).ConfigureAwait(false))
             {
                 return false;
             }
 
-            return await IsRuntimeProcessAliveAsync(cancellationToken).ConfigureAwait(false);
+            return await IsRuntimeServingAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -233,18 +247,47 @@ public sealed class CodeInterpreter
         }
     }
 
-    private async Task<bool> IsRuntimeProcessAliveAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Pings the execd daemon on the interpreter's own endpoint. Prefers the codes
+    /// service's optional <see cref="IExecdHealth"/> capability; custom adapters that
+    /// do not implement it fall back to a direct probe sharing the sandbox HTTP client.
+    /// </summary>
+    private async Task<bool> PingExecdAsync(CancellationToken cancellationToken)
+    {
+        if (Codes is IExecdHealth health)
+        {
+            return await health.PingAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (_fallbackExecdClient == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            await _fallbackExecdClient.GetAsync("/ping", cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Fallback execd ping failed for code interpreter {SandboxId}", Id);
+            return false;
+        }
+    }
+
+    private async Task<bool> IsRuntimeServingAsync(CancellationToken cancellationToken)
     {
         try
         {
             var execution = await Sandbox.Commands.RunAsync(
-                CodeInterpreterHealthCheck.RuntimeProcessCheckCommand,
+                CodeInterpreterHealthCheck.RuntimeCheckCommand,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
             return execution?.Error == null;
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Runtime process check failed for code interpreter {SandboxId}", Id);
+            _logger.LogDebug(ex, "Runtime check failed for code interpreter {SandboxId}", Id);
             return false;
         }
     }

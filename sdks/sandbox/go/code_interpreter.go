@@ -27,11 +27,13 @@ const CodeInterpreterImage = "opensandbox/code-interpreter:latest"
 var CodeInterpreterEntrypoint = []string{"/opt/code-interpreter/code-interpreter.sh"}
 
 // CodeInterpreterRuntimeCheckCommand is the script run inside the sandbox to
-// verify the code interpreter runtime process (Jupyter kernel gateway) is
-// running. execd starts serving /ping before the entrypoint launches Jupyter,
-// so a daemon ping alone cannot prove the runtime is ready. The command exits
-// 0 when the process is found.
-const CodeInterpreterRuntimeCheckCommand = "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1"
+// verify the code interpreter runtime (Jupyter kernel gateway) is actually
+// serving. execd starts serving /ping before the entrypoint launches Jupyter,
+// and the setup stage may run short-lived "jupyter kernelspec" helpers, so a
+// daemon ping or a process-name grep cannot prove the runtime is ready. Probing
+// the Jupyter listen port (127.0.0.1:${JUPYTER_PORT:-44771}, same default as
+// the entrypoint) only passes once the server accepts connections.
+const CodeInterpreterRuntimeCheckCommand = "bash -c 'exec 3<>/dev/tcp/127.0.0.1/${JUPYTER_PORT:-44771}' && exit 0 || exit 1"
 
 // CodeInterpreterCreateOptions configures code interpreter creation.
 type CodeInterpreterCreateOptions struct {
@@ -106,7 +108,7 @@ func CreateCodeInterpreter(ctx context.Context, config ConnectionConfig, opts Co
 
 	// Strict readiness: execd serving /ping (checked by WaitUntilReady above) is
 	// not enough — execd starts serving before the entrypoint launches Jupyter.
-	// Poll until the interpreter runtime process is actually running.
+	// Poll until the interpreter runtime is actually serving.
 	if !opts.SkipHealthCheck {
 		readyTimeout := opts.ReadyTimeout
 		if readyTimeout == 0 {
@@ -117,6 +119,9 @@ func CreateCodeInterpreter(ctx context.Context, config ConnectionConfig, opts Co
 			interval = DefaultHealthCheckPollingInterval
 		}
 		if err := ci.waitRuntimeReady(ctx, readyTimeout, interval); err != nil {
+			// The caller has no handle to the created sandbox; clean it up
+			// best-effort, mirroring CreateSandbox's readiness-failure path.
+			_ = sb.Kill(context.Background())
 			return nil, err
 		}
 	}
@@ -125,8 +130,8 @@ func CreateCodeInterpreter(ctx context.Context, config ConnectionConfig, opts Co
 }
 
 // IsHealthy reports whether the code interpreter is strictly healthy: the
-// execd daemon answers /ping and the interpreter runtime process (Jupyter)
-// is running inside the sandbox.
+// execd daemon answers /ping and the interpreter runtime (Jupyter kernel
+// gateway) is serving inside the sandbox.
 func (ci *CodeInterpreter) IsHealthy(ctx context.Context) bool {
 	if !ci.Sandbox.IsHealthy(ctx) {
 		return false
@@ -135,8 +140,8 @@ func (ci *CodeInterpreter) IsHealthy(ctx context.Context) bool {
 	return err == nil && exec != nil && exec.Error == nil
 }
 
-// waitRuntimeReady polls the runtime-process check until it passes or the
-// timeout expires.
+// waitRuntimeReady polls the runtime check until it passes or the timeout
+// expires.
 func (ci *CodeInterpreter) waitRuntimeReady(ctx context.Context, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -153,7 +158,7 @@ func (ci *CodeInterpreter) waitRuntimeReady(ctx context.Context, timeout, interv
 		case err != nil:
 			lastErr = err
 		default:
-			lastErr = fmt.Errorf("code interpreter runtime process (jupyter) is not running")
+			lastErr = fmt.Errorf("code interpreter runtime (jupyter) is not serving")
 		}
 
 		// Clamp the sleep to the remaining budget so the final failed check

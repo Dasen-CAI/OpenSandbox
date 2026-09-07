@@ -134,7 +134,7 @@ class CodeInterpreterTest {
         assertEquals(3, attempts)
         // The runtime leg is short-circuited while ping fails; it runs only on the
         // successful attempt (attempt 3).
-        verify(exactly = 1) { commands.run(CodeInterpreter.RUNTIME_PROCESS_CHECK_COMMAND) }
+        verify(exactly = 1) { commands.run(CodeInterpreter.RUNTIME_CHECK_COMMAND) }
     }
 
     @Test
@@ -149,7 +149,7 @@ class CodeInterpreterTest {
     }
 
     @Test
-    fun `checkReady should throw when runtime process never appears`() {
+    fun `checkReady should throw when runtime never serves`() {
         every { codeService.ping() } returns true
         every { commands.run(any<String>()) } returns
             Execution(

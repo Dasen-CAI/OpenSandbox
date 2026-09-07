@@ -30,7 +30,7 @@ function fakeSandbox(commandResult) {
   };
 }
 
-test("CodeInterpreter.create passes the strict health check once the runtime process is up", async () => {
+test("CodeInterpreter.create passes the strict health check once the runtime port is listening", async () => {
   let pingAttempts = 0;
   const codes = {
     async ping() {
@@ -51,8 +51,36 @@ test("CodeInterpreter.create passes the strict health check once the runtime pro
 
   assert.equal(pingAttempts, 2);
   assert.equal(commands.calls.length, 2);
-  assert.match(commands.calls[0], /grep jupyter/);
+  assert.ok(commands.calls[0].includes("/dev/tcp/127.0.0.1/"));
+  assert.ok(commands.calls[0].includes("${JUPYTER_PORT:-44771}"));
   assert.equal(await interpreter.isHealthy(), true);
+});
+
+test("CodeInterpreter.create falls back to a direct execd ping when codes.ping is absent", async () => {
+  const codes = {}; // custom adapter without the optional ping capability
+  const adapterFactory = { createCodes: () => codes };
+  const recorded = [];
+  const base = fakeSandbox();
+  const sandbox = {
+    ...base.sandbox,
+    connectionConfig: {
+      protocol: "http",
+      fetch: async (input) => {
+        recorded.push(input instanceof Request ? input.url : String(input));
+        return new Response("ok", { status: 200 });
+      },
+    },
+  };
+
+  const interpreter = await CodeInterpreter.create(sandbox, {
+    adapterFactory,
+    readyTimeoutSeconds: 5,
+    healthCheckPollingInterval: 10,
+  });
+
+  assert.equal(await interpreter.isHealthy(), true);
+  assert.equal(recorded.length >= 1, true);
+  assert.match(recorded[0], /\/ping$/);
 });
 
 test("CodeInterpreter.create throws when execd never answers", async () => {
@@ -76,7 +104,7 @@ test("CodeInterpreter.create throws when execd never answers", async () => {
   assert.equal(commands.calls.length, 0);
 });
 
-test("CodeInterpreter.create throws when the runtime process never appears", async () => {
+test("CodeInterpreter.create throws when the runtime port never listens", async () => {
   const codes = {
     async ping() {
       return true;
@@ -109,7 +137,7 @@ test("CodeInterpreter.create treats ping errors as unhealthy and keeps polling",
   const adapterFactory = { createCodes: () => codes };
   const { sandbox } = fakeSandbox();
 
-  const interpreter = await CodeInterpreter.create(sandbox, {
+  await CodeInterpreter.create(sandbox, {
     adapterFactory,
     readyTimeoutSeconds: 5,
     healthCheckPollingInterval: 10,
