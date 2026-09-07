@@ -152,7 +152,21 @@ internal sealed class CodesAdapter : ICodes
 
         _logger.LogInformation("Interrupting code execution: {ExecutionId}", executionId);
         var queryParams = new Dictionary<string, string?> { ["id"] = executionId };
-        await _client.DeleteAsync("/code", queryParams, cancellationToken).ConfigureAwait(false);
+        await _client.DeleteAsync("/code", queryParams, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> PingAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _client.GetAsync("/ping", cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Code interpreter ping failed");
+            return false;
+        }
     }
 
     public async IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(

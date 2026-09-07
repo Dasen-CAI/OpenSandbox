@@ -102,6 +102,38 @@ public class QuickStart {
 }
 ```
 
+## Strict Health Check
+
+`CodeInterpreter.builder().build()` blocks until the interpreter is strictly ready, then
+throws `SandboxReadyTimeoutException` if `readyTimeout` (default 30s, polled every 200ms)
+expires. An attempt is healthy only when both conditions pass:
+
+- execd answers `GET /ping` on the interpreter's own endpoint.
+- The interpreter runtime (Jupyter kernel gateway) is running inside the sandbox,
+  verified by executing a process-check script (`ps aux | grep jupyter`) through the
+  execd command API.
+
+The runtime check is required because execd serves `/ping` before the sandbox entrypoint
+launches Jupyter. The check applies regardless of the wrapped sandbox's readiness
+settings (`skipHealthCheck(true)`, pool acquire, resume).
+
+```java
+CodeInterpreter interpreter = CodeInterpreter.builder()
+    .fromSandbox(sandbox)
+    .readyTimeout(Duration.ofSeconds(60))               // optional
+    .healthCheckPollingInterval(Duration.ofMillis(200))  // optional
+    .skipHealthCheck(false)                              // pass true to opt out
+    .build();
+
+// Re-run the check on demand:
+assertTrue(interpreter.isHealthy());
+```
+
+::: tip
+`skipHealthCheck(true)` defers readiness to the caller (e.g. pool warmup that manages
+its own health checks); the interpreter may fail on first use.
+:::
+
 ## Runtime Configuration
 
 ### Docker Image

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System.Diagnostics;
 using OpenSandbox.CodeInterpreter.Factory;
 using OpenSandbox.CodeInterpreter.Services;
 using OpenSandbox.Config;
@@ -21,6 +22,21 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace OpenSandbox.CodeInterpreter;
+
+/// <summary>
+/// Strict health check script: verifies the code interpreter runtime process
+/// (Jupyter kernel gateway) is running inside the sandbox. execd starts serving
+/// <c>/ping</c> before the entrypoint launches Jupyter, so a daemon ping alone
+/// cannot prove the runtime is ready. The command exits 0 when the process is found.
+/// </summary>
+public static class CodeInterpreterHealthCheck
+{
+    /// <summary>
+    /// The shell command run inside the sandbox to detect the interpreter runtime process.
+    /// </summary>
+    public const string RuntimeProcessCheckCommand =
+        "ps aux | grep -v grep | grep jupyter > /dev/null && exit 0 || exit 1";
+}
 
 /// <summary>
 /// Options for creating a code interpreter.
@@ -36,6 +52,39 @@ public class CodeInterpreterCreateOptions
     /// Gets or sets diagnostics options such as logging.
     /// </summary>
     public SdkDiagnosticsOptions? Diagnostics { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether to skip the strict code-executor readiness check.
+    /// The returned interpreter may fail on first use if the execd daemon is
+    /// not serving yet.
+    /// </summary>
+    public bool SkipHealthCheck { get; set; }
+
+    /// <summary>
+    /// Gets or sets the timeout for the code execution service health check, in seconds.
+    /// </summary>
+    public int? ReadyTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the health check polling interval, in milliseconds.
+    /// </summary>
+    public int? HealthCheckPollingInterval { get; set; }
+}
+
+/// <summary>
+/// Options for waiting until a code interpreter is ready.
+/// </summary>
+public class CodeInterpreterWaitUntilReadyOptions
+{
+    /// <summary>
+    /// Gets or sets the timeout in seconds.
+    /// </summary>
+    public int ReadyTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets the polling interval in milliseconds.
+    /// </summary>
+    public int PollingIntervalMillis { get; set; }
 }
 
 /// <summary>
@@ -94,12 +143,21 @@ public sealed class CodeInterpreter
     /// <summary>
     /// Creates a new code interpreter from an existing sandbox.
     /// </summary>
+    /// <remarks>
+    /// By default a strict health check runs before the interpreter is returned: the code
+    /// execution service (execd) must answer <c>GET /ping</c> AND the code interpreter
+    /// runtime process (Jupyter kernel gateway) must be running inside the sandbox, both
+    /// within <see cref="CodeInterpreterCreateOptions.ReadyTimeoutSeconds"/>. execd starts
+    /// serving before the runtime process launches, so the daemon ping alone is not enough.
+    /// Set <see cref="CodeInterpreterCreateOptions.SkipHealthCheck"/> to opt out.
+    /// </remarks>
     /// <param name="sandbox">The sandbox to wrap.</param>
     /// <param name="options">Optional creation options.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A new code interpreter instance.</returns>
     /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandbox"/> is null.</exception>
     /// <exception cref="SandboxException">Thrown when endpoint discovery or adapter initialization fails.</exception>
+    /// <exception cref="SandboxReadyTimeoutException">Thrown when the code execution service health check times out.</exception>
     public static async Task<CodeInterpreter> CreateAsync(
         Sandbox sandbox,
         CodeInterpreterCreateOptions? options = null,
@@ -128,7 +186,128 @@ public sealed class CodeInterpreter
             LoggerFactory = loggerFactory
         });
 
-        return new CodeInterpreter(sandbox, codes, logger);
+        var interpreter = new CodeInterpreter(sandbox, codes, logger);
+
+        if (!(options?.SkipHealthCheck ?? false))
+        {
+            await interpreter.WaitUntilReadyAsync(new CodeInterpreterWaitUntilReadyOptions
+            {
+                ReadyTimeoutSeconds = options?.ReadyTimeoutSeconds ?? Constants.DefaultReadyTimeoutSeconds,
+                PollingIntervalMillis = options?.HealthCheckPollingInterval ?? Constants.DefaultHealthCheckPollingIntervalMillis,
+            }, cancellationToken).ConfigureAwait(false);
+        }
+
+        return interpreter;
+    }
+
+    /// <summary>
+    /// Checks whether the code interpreter is healthy (strict check).
+    /// </summary>
+    /// <remarks>
+    /// Healthy means both:
+    /// <list type="bullet">
+    /// <item>the code execution service (execd) answers <c>GET /ping</c>; and</item>
+    /// <item>the code interpreter runtime process (Jupyter kernel gateway) is running
+    /// inside the sandbox, verified by executing a process-check script through the
+    /// execd command API.</item>
+    /// </list>
+    /// Exceptions from either leg are treated as unhealthy.
+    /// </remarks>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>True if the code interpreter is healthy, false otherwise.</returns>
+    public async Task<bool> IsHealthyAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!await Codes.PingAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            return await IsRuntimeProcessAliveAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Health check failed for code interpreter {SandboxId}", Id);
+            return false;
+        }
+    }
+
+    private async Task<bool> IsRuntimeProcessAliveAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var execution = await Sandbox.Commands.RunAsync(
+                CodeInterpreterHealthCheck.RuntimeProcessCheckCommand,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            return execution?.Error == null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Runtime process check failed for code interpreter {SandboxId}", Id);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Waits until the strict health check passes (execd answers <c>GET /ping</c>
+    /// and the interpreter runtime process is alive).
+    /// </summary>
+    /// <param name="options">The wait options.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="SandboxReadyTimeoutException">Thrown when the health check times out.</exception>
+    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is canceled.</exception>
+    public async Task WaitUntilReadyAsync(
+        CodeInterpreterWaitUntilReadyOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug(
+            "Start readiness check for code interpreter {SandboxId} (timeoutSeconds={TimeoutSeconds})",
+            Id, options.ReadyTimeoutSeconds);
+        var timeout = TimeSpan.FromSeconds(options.ReadyTimeoutSeconds);
+        var stopwatch = Stopwatch.StartNew();
+        var attempt = 0;
+        var errorDetail = "Health check returned false continuously.";
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (stopwatch.Elapsed > timeout)
+            {
+                throw new SandboxReadyTimeoutException(
+                    $"Code interpreter {Id} health check timed out after {options.ReadyTimeoutSeconds}s ({attempt} attempts). " +
+                    $"{errorDetail} The code execution service (execd) or the interpreter runtime (Jupyter) " +
+                    "did not become ready. Set SkipHealthCheck to skip this check.");
+            }
+            attempt++;
+
+            try
+            {
+                if (await IsHealthyAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    _logger.LogInformation("Code interpreter is ready: {SandboxId}", Id);
+                    return;
+                }
+
+                errorDetail = "Health check returned false continuously.";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Readiness probe failed for code interpreter {SandboxId}", Id);
+                errorDetail = $"Last health check error: {ex.Message}";
+            }
+
+            var remaining = timeout - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                continue;
+            }
+
+            var pollingInterval = TimeSpan.FromMilliseconds(options.PollingIntervalMillis);
+            var delay = pollingInterval < remaining ? pollingInterval : remaining;
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static IReadOnlyDictionary<string, string> MergeHeaders(

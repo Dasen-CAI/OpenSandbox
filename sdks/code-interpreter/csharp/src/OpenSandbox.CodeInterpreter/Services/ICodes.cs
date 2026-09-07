@@ -102,4 +102,16 @@ public interface ICodes
     /// <exception cref="InvalidArgumentException">Thrown when <paramref name="executionId"/> is null or empty.</exception>
     /// <exception cref="SandboxException">Thrown when the sandbox service request fails.</exception>
     Task InterruptAsync(string executionId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Checks whether the code execution service (execd) is responsive.
+    /// </summary>
+    /// <remarks>
+    /// The ping targets the execd daemon endpoint used by this service (<c>GET /ping</c>).
+    /// It does not verify that a specific language runtime is ready, only that the daemon
+    /// serving code execution requests is responsive.
+    /// </remarks>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>True if the code execution service is responsive, false otherwise.</returns>
+    Task<bool> PingAsync(CancellationToken cancellationToken = default);
 }

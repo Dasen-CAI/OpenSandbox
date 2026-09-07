@@ -46,4 +46,13 @@ export interface Codes {
   ): AsyncIterable<ServerStreamEvent>;
 
   interrupt(contextId: string): Promise<void>;
+
+  /**
+   * Check if the code execution service (execd) is responsive.
+   *
+   * The ping targets the execd daemon endpoint used by this service
+   * (`GET /ping`). It does not verify that a specific language runtime is
+   * ready, only that the daemon serving code execution requests is responsive.
+   */
+  ping(signal?: AbortSignal): Promise<boolean>;
 }
