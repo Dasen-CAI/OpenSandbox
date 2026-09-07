@@ -26,31 +26,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
-	inttelemetry "github.com/alibaba/opensandbox/internal/telemetry"
 )
-
-func TestAppendMetricAttrsFromKeyValuePairs(t *testing.T) {
-	var base []attribute.KeyValue
-	out := inttelemetry.AppendAttrsFromKeyValuePairs(base, "a=b")
-	assert.Len(t, out, 1)
-	assert.Equal(t, "a", string(out[0].Key))
-	assert.Equal(t, "b", out[0].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "  foo=bar  , baz=qux ")
-	assert.Len(t, out, 2)
-	assert.Equal(t, "foo", string(out[0].Key))
-	assert.Equal(t, "bar", out[0].Value.AsString())
-	assert.Equal(t, "baz", string(out[1].Key))
-	assert.Equal(t, "qux", out[1].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "k=v=x")
-	assert.Len(t, out, 1)
-	assert.Equal(t, "k", string(out[0].Key))
-	assert.Equal(t, "v=x", out[0].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "novalue=,=bad,nokv")
-	assert.Len(t, out, 0)
-}
 
 // The instrument records seconds, so it needs boundaries on a seconds ladder. With the
 // SDK default (the spec's millisecond ladder) every realistic DNS latency collapses into
@@ -151,4 +127,75 @@ func collectEgressMetrics(t *testing.T) map[string]float64 {
 		}
 	}
 	return out
+}
+
+// The failure counters carry a bounded attribute on top of the shared set. This checks the
+// attribute lands and, critically, that adding it does not corrupt the shared slice: it is
+// returned by a sync.OnceValue and may have spare capacity, so appending in place would
+// leak one call's reason into the next.
+func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(previous) })
+	require.NoError(t, registerEgressMetrics())
+
+	RecordDNSQueryFailed(DNSFailureUpstreamError)
+	RecordDNSQueryFailed(DNSFailureRcode)
+	RecordDNSQueryFailed(DNSFailureUpstreamError)
+	RecordNftablesUpdateFailed(NftOpDynamicAdd)
+	RecordDNSReplyFailed(DNSReplyStageAnswer)
+	RecordDNSReplyFailed(DNSReplyStageAnswer)
+	RecordDNSReplyFailed(DNSReplyStageDeny)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	dns := counterByAttr(t, &rm, "egress.dns.query.failed_total", "reason")
+	assert.Equal(t, map[string]int64{
+		DNSFailureUpstreamError: 2,
+		DNSFailureRcode:         1,
+	}, dns, "each reason must be its own stream")
+
+	reply := counterByAttr(t, &rm, "egress.dns.reply.failed_total", "stage")
+	assert.Equal(t, map[string]int64{
+		DNSReplyStageAnswer: 2,
+		DNSReplyStageDeny:   1,
+	}, reply, "each stage must be its own stream")
+
+	nft := counterByAttr(t, &rm, "egress.nftables.updates.failed_total", "operation")
+	assert.Equal(t, map[string]int64{NftOpDynamicAdd: 1}, nft)
+}
+
+// counterByAttr sums an Int64 counter's data points keyed by one attribute, and asserts
+// every point still carries the shared attributes it was created with.
+//
+// It compares against egressSharedAttrs() rather than a fixed sandbox_id: that slice comes
+// from a sync.OnceValue resolved by whichever test records first, so hardcoding a value here
+// would make this test depend on the order tests run in.
+func counterByAttr(t *testing.T, rm *metricdata.ResourceMetrics, name, key string) map[string]int64 {
+	t.Helper()
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "unexpected aggregation %T for %s", m.Data, name)
+			for _, dp := range sum.DataPoints {
+				value, found := dp.Attributes.Value(attribute.Key(key))
+				require.True(t, found, "%s data point without a %q attribute: %v", name, key, dp.Attributes)
+				for _, want := range egressSharedAttrs() {
+					got, present := dp.Attributes.Value(want.Key)
+					require.True(t, present, "shared attribute %s was lost: %v", want.Key, dp.Attributes)
+					require.Equal(t, want.Value.AsString(), got.AsString())
+				}
+				out[value.AsString()] += dp.Value
+			}
+			return out
+		}
+	}
+	t.Fatalf("%s not collected", name)
+	return nil
 }

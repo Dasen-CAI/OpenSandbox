@@ -14,6 +14,8 @@
 
 package flag
 
+import "time"
+
 var (
 	// LogLevel controls the router log verbosity.
 	LogLevel string
@@ -34,4 +36,15 @@ var (
 	RenewIntentMinIntervalSec int
 
 	SecureAccessKeys string
+
+	FastPathEndpoint          string
+	FastPathAccessMode        string
+	FastPathWaitTimeoutMillis int
+
+	NetworkReadinessShadowWindow               time.Duration
+	NetworkReadinessShadowMaxTargets           int
+	NetworkReadinessShadowMinAttempts          uint64
+	NetworkReadinessShadowMinTargets           int
+	NetworkReadinessShadowMinSignalTargets     int
+	NetworkReadinessShadowDegradedFailureRatio float64
 )

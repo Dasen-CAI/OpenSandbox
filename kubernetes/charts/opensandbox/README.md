@@ -2,6 +2,13 @@
 
 This Helm chart bundles both the **OpenSandbox Controller** and **OpenSandbox Server** into a single deployment for simplified installation.
 
+> **Single-active Server default**: The chart deploys one active Lifecycle
+> Server by default. Multi-replica Server HA is not supported yet, including
+> with a shared PostgreSQL database. PostgreSQL-backed Kubernetes HA will be
+> delivered in a separate change. The Server Deployment uses the `Recreate`
+> strategy so an upgrade stops the active Server before starting its
+> replacement; expect a brief API interruption during upgrades.
+
 ## Prerequisites
 
 - Kubernetes 1.21.1+
@@ -49,12 +56,30 @@ This chart installs:
    - Connects to the controller for resource orchestration
    - Optional ingress gateway support
 
-## Configuration
-
 Most configuration is inherited from the sub-charts. See individual chart documentation:
 
 - [Controller Configuration](../opensandbox-controller/README.md)
 - [Server Configuration](../opensandbox-server/README.md)
+
+## Configuration
+
+The following table lists the configurable parameters of the chart and their default values.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| global | string | `nil` | Global values passed to both sub-charts. |
+| opensandbox-controller.controller.logLevel | string | `"info"` | Controller log level (debug, info, error). |
+| opensandbox-controller.controller.replicaCount | int | `1` | Number of controller replicas. |
+| opensandbox-controller.controller.snapshot | object | `{"commitJobTimeout":"10m","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1","imageCommitterPodTemplate":{},"registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration. |
+| opensandbox-controller.controller.snapshot.commitJobTimeout | string | `"10m"` | Timeout duration for commit jobs. |
+| opensandbox-controller.controller.snapshot.imageCommitterImage | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1"` | Image used for commit operations. |
+| opensandbox-controller.controller.snapshot.imageCommitterPodTemplate | object | `{}` | PodTemplateSpec overlay for image-committer commit Job Pods. |
+| opensandbox-controller.controller.snapshot.registry | string | `""` | OCI registry prefix used for snapshot images. |
+| opensandbox-controller.controller.snapshot.registryInsecure | bool | `false` | Use insecure registry mode when pushing snapshot images. |
+| opensandbox-controller.controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
+| opensandbox-controller.controller.snapshot.snapshotPushSecret | string | `""` | Secret name used by commit Jobs to push snapshot images. |
+| opensandbox-node-agent.enabled | bool | `false` | Whether the node agent is enabled. |
+| opensandbox-server.server.replicaCount | int | `1` | Number of server replicas. Keep one active server; multi-replica HA is not supported yet. |
 
 ### Override Sub-chart Values
 
@@ -70,11 +95,23 @@ opensandbox-controller:
       registry: my-registry/snapshots
       registryInsecure: false
       snapshotPushSecret: registry-snapshot-push-secret
+      imageCommitterPodTemplate:
+        metadata:
+          labels:
+            identity.example/use: "true"
+        spec:
+          serviceAccountName: snapshot-committer
+          containers:
+            - name: commit
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
       resumePullSecret: registry-pull-secret
 
 opensandbox-server:
   server:
-    replicaCount: 2
+    replicaCount: 1
     gateway:
       enabled: true
       host: gateway.example.com

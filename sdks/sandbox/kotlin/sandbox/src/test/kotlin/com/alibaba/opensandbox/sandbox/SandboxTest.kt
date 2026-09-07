@@ -17,6 +17,7 @@
 package com.alibaba.opensandbox.sandbox
 
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
@@ -310,6 +311,43 @@ class SandboxTest {
     }
 
     @Test
+    fun `checkReady should propagate wrapped interruption and restore interrupt status`() {
+        val interrupted = InterruptedException("acquire cancelled")
+        val wrapped = RuntimeException("health check interrupted", interrupted)
+        val sandboxWithInterruptingHealthCheck =
+            Sandbox(
+                id = sandboxId,
+                sandboxService = sandboxService,
+                fileSystemService = fileSystemService,
+                commandService = commandService,
+                healthService = healthService,
+                metricsService = metricsService,
+                egressService = egressService,
+                credentialVaultService = credentialVaultService,
+                isolatedService = mockk(),
+                customHealthCheck = { throw wrapped },
+                httpClientProvider = httpClientProvider,
+                diagnosticsService = diagnosticsService,
+            )
+
+        Thread.interrupted()
+        try {
+            val actual =
+                assertThrows(RuntimeException::class.java) {
+                    sandboxWithInterruptingHealthCheck.checkReady(
+                        Duration.ofSeconds(1),
+                        Duration.ofMillis(10),
+                    )
+                }
+
+            assertSame(wrapped, actual)
+            assertTrue(Thread.currentThread().isInterrupted)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
     fun `checkReady should throw exception when timeout`() {
         every { healthService.ping(sandboxId) } returns false
 
@@ -319,7 +357,32 @@ class SandboxTest {
     }
 
     @Test
-    fun `checkReady timeout should include connection context and bridge hint`() {
+    fun `checkReady timeout should not overshoot by a polling interval`() {
+        every { healthService.ping(sandboxId) } returns false
+
+        val start = System.nanoTime()
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandbox.checkReady(Duration.ofMillis(20), Duration.ofSeconds(2))
+        }
+        val elapsed = Duration.ofNanos(System.nanoTime() - start)
+
+        assertTrue(elapsed < Duration.ofMillis(500), "expected timeout in ~20ms, took ${elapsed.toMillis()}ms")
+    }
+
+    @Test
+    fun `checkReady should reject non-positive polling interval before polling`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            sandbox.checkReady(Duration.ofSeconds(1), Duration.ofMillis(-1))
+        }
+        assertThrows(InvalidArgumentException::class.java) {
+            sandbox.checkReady(Duration.ofSeconds(1), Duration.ZERO)
+        }
+
+        verify(exactly = 0) { healthService.ping(any()) }
+    }
+
+    @Test
+    fun `checkReady timeout should include diagnostics without network configuration hints`() {
         every { healthService.ping(sandboxId) } throws RuntimeException("connect ECONNREFUSED")
 
         val ex =
@@ -328,27 +391,10 @@ class SandboxTest {
             }
 
         assertTrue(ex.message!!.contains("Connection context: domain=localhost:8080, useServerProxy=false"))
-        assertTrue(ex.message!!.contains("useServerProxy=true"))
-        assertTrue(ex.message!!.contains("[docker].host_ip"))
-        assertTrue(ex.message!!.contains("Last error: connect ECONNREFUSED"))
-    }
-
-    @Test
-    fun `checkReady timeout should omit host_ip hint when server proxy is enabled`() {
-        val proxyEnabledConfig =
-            ConnectionConfig.builder()
-                .domain("localhost:8080")
-                .useServerProxy(true)
-                .build()
-        every { httpClientProvider.config } returns proxyEnabledConfig
-        every { healthService.ping(sandboxId) } returns false
-
-        val ex =
-            assertThrows(SandboxReadyTimeoutException::class.java) {
-                sandbox.checkReady(Duration.ofMillis(100), Duration.ofMillis(10))
-            }
-
-        assertTrue(ex.message!!.contains("useServerProxy=true"))
+        assertFalse(ex.message!!.contains("consider enabling useServerProxy=true", ignoreCase = true))
+        assertFalse(ex.message!!.contains("Docker bridge", ignoreCase = true))
+        assertFalse(ex.message!!.contains("remote-network", ignoreCase = true))
         assertFalse(ex.message!!.contains("[docker].host_ip"))
+        assertTrue(ex.message!!.contains("Last error: connect ECONNREFUSED"))
     }
 }

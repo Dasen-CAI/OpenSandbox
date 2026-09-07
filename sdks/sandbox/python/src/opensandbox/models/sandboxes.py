@@ -21,9 +21,13 @@ Models for sandbox creation, configuration, status, and lifecycle management.
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from opensandbox.config import ConnectionConfig
+    from opensandbox.config.connection_sync import ConnectionConfigSync
 
 
 class SandboxImageAuth(BaseModel):
@@ -157,6 +161,71 @@ class CredentialProxyConfig(BaseModel):
         default=False,
         description="Enable transparent MITM support required by Credential Vault injection.",
     )
+
+
+class LifecycleHook(BaseModel):
+    """Command executed by execd before the user entrypoint starts."""
+
+    command: list[str] = Field(min_length=1)
+    timeout_seconds: int | None = Field(
+        default=None,
+        alias="timeoutSeconds",
+        description="Maximum execution time in seconds. The server validates the value and defaults to 60.",
+    )
+
+    @field_validator("command")
+    @classmethod
+    def command_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        if not value[0].strip():
+            raise ValueError("Lifecycle hook command must not be empty")
+        return value
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class PeriodicLifecycleHook(BaseModel):
+    """Named command scheduled by execd while the sandbox is running."""
+
+    name: str = Field(min_length=1)
+    schedule: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    timeout_seconds: int | None = Field(
+        default=None,
+        alias="timeoutSeconds",
+        description="Maximum execution time in seconds. The server validates the value and defaults to 60.",
+    )
+
+    @field_validator("name", "schedule")
+    @classmethod
+    def text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Periodic lifecycle hook fields must not be blank")
+        return value.strip()
+
+    @field_validator("command")
+    @classmethod
+    def command_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        if not value[0].strip():
+            raise ValueError("Periodic lifecycle hook command must not be empty")
+        return value
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class SandboxLifecycle(BaseModel):
+    """Optional lifecycle hooks applied when a sandbox is created."""
+
+    pre_start: LifecycleHook | None = Field(default=None, alias="preStart")
+    periodic: list[PeriodicLifecycleHook] | None = None
+
+    @model_validator(mode="after")
+    def periodic_names_must_be_unique(self) -> "SandboxLifecycle":
+        names = [hook.name for hook in self.periodic or []]
+        if len(names) != len(set(names)):
+            raise ValueError("Periodic lifecycle hook names must be unique")
+        return self
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class InlineCredentialSource(BaseModel):
@@ -584,6 +653,18 @@ class SandboxStatus(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class SandboxAllocation(BaseModel):
+    """Current runtime-confirmed Pool allocation for a sandbox."""
+
+    mode: Literal["pool"] = Field(description="Confirmed allocation mode.")
+    pool_ref: str = Field(
+        description="Concrete Pool reference currently allocated to the sandbox."
+    )
+    state: Literal["allocated"] = Field(
+        description="Current confirmed allocation state."
+    )
+
+
 class SnapshotStatus(BaseModel):
     """
     Status information for a snapshot.
@@ -649,6 +730,10 @@ class SandboxInfo(BaseModel):
     platform: PlatformSpec | None = Field(
         default=None, description="Effective platform used for sandbox provisioning."
     )
+    allocation: SandboxAllocation | None = Field(
+        default=None,
+        description="Current runtime-confirmed Pool allocation, when available.",
+    )
     metadata: dict[str, str] | None = Field(default=None, description="Custom metadata")
     extensions: dict[str, str] | None = Field(
         default=None, description="Opaque extension data returned by the server"
@@ -702,6 +787,29 @@ class SandboxEndpoint(BaseModel):
         default_factory=dict,
         description="Headers that must be included on every request targeting this endpoint (e.g. when the server requires them for routing or auth). Empty if not required.",
     )
+
+    def build_request_headers(
+        self,
+        connection_config: "ConnectionConfig | ConnectionConfigSync",
+    ) -> dict[str, str]:
+        """
+        Default headers for execd-plane requests to this endpoint.
+
+        The API key is attached only when the client declared server-proxy
+        mode (``ConnectionConfig.use_server_proxy``): such requests pass the
+        server's auth gate. In direct mode execd performs no auth and the
+        key must never travel into the untrusted sandbox.
+        """
+        headers = {
+            "User-Agent": connection_config.user_agent,
+            **connection_config.headers,
+            **self.headers,
+        }
+        if connection_config.use_server_proxy:
+            api_key = connection_config.get_api_key()
+            if api_key:
+                headers["OPEN-SANDBOX-API-KEY"] = api_key
+        return headers
 
 
 class PaginationInfo(BaseModel):

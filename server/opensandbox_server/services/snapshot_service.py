@@ -39,12 +39,14 @@ from opensandbox_server.api.schema import (
     Snapshot,
     SnapshotStatus,
 )
-from opensandbox_server.repositories.snapshots.factory import create_snapshot_repository
+from opensandbox_server.repositories.snapshots.factory import get_snapshot_repository
 from opensandbox_server.services.constants import SnapshotErrorCodes
 from opensandbox_server.services.snapshot_runtime import (
     NoopSnapshotRuntime,
     SnapshotRuntime,
+    SnapshotRuntimePreflightError,
     SnapshotRuntimeStatus,
+    SnapshotRuntimeUnsupportedError,
 )
 from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
 from opensandbox_server.services.snapshot_models import (
@@ -128,11 +130,34 @@ class PersistedSnapshotService(SnapshotService):
                 },
             )
 
+        namespace = self._get_tenant_namespace()
+        try:
+            self._snapshot_runtime.preflight_create_snapshot(
+                sandbox_id,
+                namespace=namespace,
+            )
+        except SnapshotRuntimeUnsupportedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SnapshotErrorCodes.UNSUPPORTED_RUNTIME,
+                    "message": str(exc),
+                },
+            ) from exc
+        except SnapshotRuntimePreflightError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SnapshotErrorCodes.RUNTIME_PREFLIGHT_FAILED,
+                    "message": str(exc),
+                },
+            ) from exc
+
         now = datetime.now(timezone.utc)
         record = SnapshotRecord(
             id=str(uuid4()),
             source_sandbox_id=sandbox_id,
-            namespace=self._get_tenant_namespace(),
+            namespace=namespace,
             name=request.name,
             restore_config=self._default_restore_config(),
             status=SnapshotStatusRecord(
@@ -562,7 +587,7 @@ def create_snapshot_service(sandbox_service) -> SnapshotService:
     )
 
     return PersistedSnapshotService(
-        snapshot_repository=create_snapshot_repository(),
+        snapshot_repository=get_snapshot_repository(),
         sandbox_service=sandbox_service,
         snapshot_runtime=snapshot_runtime,
     )

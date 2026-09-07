@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -227,4 +228,219 @@ func TestApplyStatic_NormalizesOverlappingAllow(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, m.ApplyStatic(context.Background(), p))
 	expectContains(t, rendered, "add element inet opensandbox allow_v4 { 100.64.0.0/10 }")
+}
+
+func TestRefreshActiveConnections_RenewsKnownActiveIP(t *testing.T) {
+	var scripts []string
+	m := NewManagerWithRunner(func(_ context.Context, script string) ([]byte, error) {
+		scripts = append(scripts, script)
+		return nil, nil
+	})
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: time.Minute},
+	}))
+
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), []tcpConnection{
+		{remote: netip.MustParseAddr("1.1.1.1"), state: "ESTABLISHED"},
+		{remote: netip.MustParseAddr("2.2.2.2"), state: "ESTABLISHED"},
+		{remote: netip.MustParseAddr("1.1.1.1"), state: "TIME_WAIT"},
+	}, m))
+
+	require.Len(t, scripts, 2)
+	require.Equal(t, "add element inet opensandbox dyn_allow_v4 { 1.1.1.1 timeout 360s }\n", scripts[1])
+}
+
+func TestRefreshActiveConnections_RenewsOnceAfterConnectionCloses(t *testing.T) {
+	var scripts []string
+	m := NewManagerWithRunner(func(_ context.Context, script string) ([]byte, error) {
+		scripts = append(scripts, script)
+		return nil, nil
+	})
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("2001:db8::1"), TTL: time.Minute},
+	}))
+	active := []tcpConnection{
+		{remote: netip.MustParseAddr("2001:db8::1"), state: "ESTABLISHED"},
+	}
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), active, m))
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), nil, m))
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), nil, m))
+
+	require.Len(t, scripts, 3)
+	require.Equal(t, "add element inet opensandbox dyn_allow_v6 { 2001:db8::1 timeout 360s }\n", scripts[1])
+	require.Equal(t, scripts[1], scripts[2])
+}
+
+func TestApplyStatic_ClearsTrackedDynamicIPs(t *testing.T) {
+	var scripts []string
+	m := NewManagerWithRunner(func(_ context.Context, script string) ([]byte, error) {
+		scripts = append(scripts, script)
+		return nil, nil
+	})
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: time.Minute},
+	}))
+	require.NoError(t, m.ApplyStatic(context.Background(), policy.DefaultDenyPolicy()))
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), []tcpConnection{
+		{remote: netip.MustParseAddr("1.1.1.1"), state: "ESTABLISHED"},
+	}, m))
+
+	require.Len(t, scripts, 2)
+}
+
+func TestAddResolvedIPs_DoesNotTrackFailedInsert(t *testing.T) {
+	m := NewManagerWithRunner(func(_ context.Context, _ string) ([]byte, error) {
+		return nil, fmt.Errorf("nft failed")
+	})
+	require.Error(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: time.Minute},
+	}))
+
+	m.run = func(_ context.Context, _ string) ([]byte, error) {
+		require.FailNow(t, "failed insert must not become refresh eligible")
+		return nil, nil
+	}
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), []tcpConnection{
+		{remote: netip.MustParseAddr("1.1.1.1"), state: "ESTABLISHED"},
+	}, m))
+}
+
+func TestRefreshActiveConnections_ForgetsExpiredInactiveIP(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	m := NewManagerWithRunner(func(_ context.Context, _ string) ([]byte, error) {
+		return nil, nil
+	})
+	m.tracker.now = func() time.Time { return now }
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: 10 * time.Second},
+	}))
+	now = now.Add(71 * time.Second)
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), nil, m))
+
+	require.Empty(t, m.tracker.dynamicIPs)
+}
+
+func TestRefreshActiveConnections_RenewsExpiredActiveIP(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	var scripts []string
+	m := NewManagerWithRunner(func(_ context.Context, script string) ([]byte, error) {
+		scripts = append(scripts, script)
+		return nil, nil
+	})
+	m.tracker.now = func() time.Time { return now }
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: 10 * time.Second},
+	}))
+	now = now.Add(71 * time.Second)
+	require.NoError(t, m.tracker.refreshActiveConnections(context.Background(), []tcpConnection{
+		{remote: netip.MustParseAddr("1.1.1.1"), state: "ESTABLISHED"},
+	}, m))
+
+	require.Len(t, scripts, 2)
+	require.Equal(t, now.Add(6*time.Minute), m.tracker.dynamicIPs[netip.MustParseAddr("1.1.1.1")])
+}
+
+func TestStartConnectionRefresh_StopsWithContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{}, 1)
+	m := NewManagerWithRunnerAndOptions(func(_ context.Context, _ string) ([]byte, error) {
+		return nil, nil
+	}, Options{ConnectionRefreshInterval: time.Millisecond})
+	m.tracker.listConnections = func(context.Context) ([]tcpConnection, error) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		return nil, nil
+	}
+	m.StartConnectionRefresh(ctx)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		require.FailNow(t, "refresh worker did not run")
+	}
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+	for len(called) > 0 {
+		<-called
+	}
+	time.Sleep(10 * time.Millisecond)
+	require.Empty(t, called)
+}
+
+func TestStartConnectionRefresh_PollErrorClearsPriorActivity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var scripts []string
+	var polls int
+	done := make(chan struct{})
+	m := NewManagerWithRunnerAndOptions(func(_ context.Context, script string) ([]byte, error) {
+		scripts = append(scripts, script)
+		return nil, nil
+	}, Options{ConnectionRefreshInterval: time.Millisecond})
+	m.tracker.listConnections = func(context.Context) ([]tcpConnection, error) {
+		polls++
+		switch polls {
+		case 1:
+			return []tcpConnection{{remote: netip.MustParseAddr("1.1.1.1"), state: "ESTABLISHED"}}, nil
+		case 2:
+			return nil, fmt.Errorf("proc unavailable")
+		default:
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+			return nil, nil
+		}
+	}
+	require.NoError(t, m.AddResolvedIPs(context.Background(), []ResolvedIP{
+		{Addr: netip.MustParseAddr("1.1.1.1"), TTL: time.Minute},
+	}))
+	m.StartConnectionRefresh(ctx)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "refresh worker did not complete poll sequence")
+	}
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+
+	// Initial insert plus the active renewal. A stale final renewal must not be
+	// emitted after the observation gap.
+	require.Len(t, scripts, 2)
+}
+
+func TestNewManager_DefaultsConnectionRefreshInterval(t *testing.T) {
+	m := NewManagerWithOptions(Options{})
+	require.Equal(t, 30*time.Second, m.opts.ConnectionRefreshInterval)
+}
+
+func TestManagerSerializesConcurrentTrackerUpdates(t *testing.T) {
+	m := NewManagerWithRunner(func(_ context.Context, _ string) ([]byte, error) {
+		return nil, nil
+	})
+	addr := netip.MustParseAddr("1.1.1.1")
+	var wg sync.WaitGroup
+	errs := make(chan error, 60)
+	for range 20 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			errs <- m.AddResolvedIPs(context.Background(), []ResolvedIP{{Addr: addr, TTL: time.Minute}})
+		}()
+		go func() {
+			defer wg.Done()
+			errs <- m.tracker.refreshActiveConnections(context.Background(), []tcpConnection{{remote: addr, state: "ESTABLISHED"}}, m)
+		}()
+		go func() {
+			defer wg.Done()
+			errs <- m.ApplyStatic(context.Background(), policy.DefaultDenyPolicy())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }

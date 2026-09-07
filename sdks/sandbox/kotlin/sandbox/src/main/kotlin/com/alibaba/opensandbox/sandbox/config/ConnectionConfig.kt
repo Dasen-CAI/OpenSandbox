@@ -16,6 +16,7 @@
 
 package com.alibaba.opensandbox.sandbox.config
 
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
 import okhttp3.ConnectionPool
 import java.time.Duration
 
@@ -58,6 +59,31 @@ class ConnectionConfig private constructor(
      * Also honored via the `OPENSANDBOX_DISABLE_METRICS=1` environment variable.
      */
     val disableMetrics: Boolean = false,
+    /** Internal staged-warmup override: suppress only the legacy sandbox.create event. */
+    internal val suppressCreateMetrics: Boolean = false,
+    /**
+     * Enable OpenTelemetry tracing for the client-side sandbox pool warmup path.
+     *
+     * Off by default. When enabled, each pool warmup creates an OpenTelemetry
+     * trace (`pool.warmup` root span plus per-phase spans) and the active
+     * trace context is propagated to lifecycle requests via the W3C
+     * `traceparent` header. Tracing is best-effort: without an
+     * OpenTelemetry SDK + exporter on the classpath, all span calls are
+     * no-ops and nothing is exported.
+     */
+    val enableTracing: Boolean = false,
+    /**
+     * Retry policy applied to non-streaming requests. Enabled by default; pass
+     * [RetryPolicy.disabled] to disable SDK-policy retries and fall back to
+     * OkHttp's built-in connection recovery. SSE / streaming requests bypass
+     * the SDK retry policy and disable built-in connection recovery regardless
+     * of this value because they cannot be safely replayed.
+     */
+    val retryPolicy: RetryPolicy = RetryPolicy(),
+    /** Internal override used by single-attempt operations to disable OkHttp connection recovery. */
+    internal val retryOnConnectionFailure: Boolean = true,
+    /** Internal transport mode used only by staged pool warmup health probes. */
+    internal val singleAttemptHealthChecks: Boolean = false,
 ) {
     /**
      * Creates a copy of this ConnectionConfig without copying the connectionPool.
@@ -79,6 +105,99 @@ class ConnectionConfig private constructor(
             endpointCacheSize = this.endpointCacheSize,
             endpointCacheDisabled = this.endpointCacheDisabled,
             disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
+            enableTracing = this.enableTracing,
+            retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
+        )
+
+    /**
+     * Creates a copy of this ConnectionConfig that uses [connectionPool] and
+     * marks it as SDK-managed (evicted when the owning component closes).
+     *
+     * Internal to the SDK: only [com.alibaba.opensandbox.sandbox.pool.SandboxPool]
+     * injects its pool-created shared pool this way and evicts it on shutdown.
+     * It is not public API — callers cannot rely on the eviction promise
+     * because [HttpClientProvider] only evicts pools it created itself.
+     */
+    internal fun copyWithConnectionPool(connectionPool: ConnectionPool): ConnectionConfig =
+        ConnectionConfig(
+            apiKey = this.apiKey,
+            domain = this.domain,
+            protocol = this.protocol,
+            requestTimeout = this.requestTimeout,
+            debug = this.debug,
+            userAgent = this.userAgent,
+            headers = this.headers,
+            connectionPool = connectionPool,
+            connectionPoolManagedByUser = false,
+            useServerProxy = this.useServerProxy,
+            endpointCacheTtl = this.endpointCacheTtl,
+            endpointCacheSize = this.endpointCacheSize,
+            endpointCacheDisabled = this.endpointCacheDisabled,
+            disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
+            enableTracing = this.enableTracing,
+            retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
+        )
+
+    /**
+     * Creates an internal transport configuration that performs exactly one HTTP attempt.
+     * Public [RetryPolicy.disabled] semantics remain unchanged and still allow OkHttp recovery.
+     */
+    internal fun copyForSingleAttempt(): ConnectionConfig =
+        ConnectionConfig(
+            apiKey = this.apiKey,
+            domain = this.domain,
+            protocol = this.protocol,
+            requestTimeout = this.requestTimeout,
+            debug = this.debug,
+            userAgent = this.userAgent,
+            headers = this.headers,
+            connectionPool = this.connectionPool,
+            connectionPoolManagedByUser = this.connectionPoolManagedByUser,
+            useServerProxy = this.useServerProxy,
+            endpointCacheTtl = this.endpointCacheTtl,
+            endpointCacheSize = this.endpointCacheSize,
+            endpointCacheDisabled = this.endpointCacheDisabled,
+            disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
+            enableTracing = this.enableTracing,
+            retryPolicy = RetryPolicy.disabled(),
+            retryOnConnectionFailure = false,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
+        )
+
+    /**
+     * Derives the connection configuration used by a staged warmup Sandbox.
+     *
+     * Only health probes become single-attempt requests. Other operations retain
+     * the caller's retry policy, and the original configuration is unchanged.
+     */
+    internal fun copyForStagedWarmup(): ConnectionConfig =
+        ConnectionConfig(
+            apiKey = this.apiKey,
+            domain = this.domain,
+            protocol = this.protocol,
+            requestTimeout = this.requestTimeout,
+            debug = this.debug,
+            userAgent = this.userAgent,
+            headers = this.headers,
+            connectionPool = this.connectionPool,
+            connectionPoolManagedByUser = this.connectionPoolManagedByUser,
+            useServerProxy = this.useServerProxy,
+            endpointCacheTtl = this.endpointCacheTtl,
+            endpointCacheSize = this.endpointCacheSize,
+            endpointCacheDisabled = this.endpointCacheDisabled,
+            disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = true,
+            enableTracing = this.enableTracing,
+            retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = true,
         )
 
     companion object {
@@ -88,7 +207,7 @@ class ConnectionConfig private constructor(
         private const val ENV_DOMAIN = "OPEN_SANDBOX_DOMAIN"
         internal const val ENV_DISABLE_METRICS = "OPENSANDBOX_DISABLE_METRICS"
 
-        private const val DEFAULT_USER_AGENT = "OpenSandbox-Kotlin-SDK/1.0.17"
+        private const val DEFAULT_USER_AGENT = "OpenSandbox-Kotlin-SDK/1.0.19"
         private const val API_VERSION = "v1"
 
         @JvmStatic
@@ -105,6 +224,9 @@ class ConnectionConfig private constructor(
         val envValue = System.getenv(ENV_DISABLE_METRICS)?.trim()
         return envValue == "1"
     }
+
+    /** Returns whether the legacy sandbox.create lifecycle event should be skipped. */
+    internal fun isCreateMetricsDisabled(): Boolean = suppressCreateMetrics || isMetricsDisabled()
 
     fun getApiKey(): String {
         return this.apiKey ?: System.getenv(ENV_API_KEY) ?: ""
@@ -178,6 +300,8 @@ class ConnectionConfig private constructor(
         private var endpointCacheSize: Int = 1024
         private var endpointCacheDisabled: Boolean = false
         private var disableMetrics: Boolean = false
+        private var enableTracing: Boolean = false
+        private var retryPolicy: RetryPolicy = RetryPolicy()
 
         /**
          * Use sandbox server as proxy for process execd requests.
@@ -214,6 +338,17 @@ class ConnectionConfig private constructor(
         @JvmOverloads
         fun disableMetrics(disabled: Boolean = true): Builder {
             this.disableMetrics = disabled
+            return this
+        }
+
+        /**
+         * Enable OpenTelemetry tracing for the client-side sandbox pool warmup path.
+         *
+         * Off by default; pass `true` to opt in. Tracing is best-effort and no-ops
+         * unless an OpenTelemetry SDK + exporter is on the classpath.
+         */
+        fun enableTracing(enable: Boolean = true): Builder {
+            this.enableTracing = enable
             return this
         }
 
@@ -280,6 +415,20 @@ class ConnectionConfig private constructor(
         fun connectionPool(connectionPool: ConnectionPool): Builder {
             this.connectionPool = connectionPool
             this.connectionPoolManagedByUser = true
+            return this
+        }
+
+        /**
+         * Set the retry policy applied to non-streaming requests.
+         *
+         * Retries are enabled by default (idempotent methods only). Pass
+         * [RetryPolicy.disabled] to disable SDK-policy retries and fall back to
+         * OkHttp's built-in connection recovery. SSE / streaming requests bypass
+         * the SDK retry policy and disable built-in connection recovery because
+         * they cannot be safely replayed.
+         */
+        fun retryPolicy(retryPolicy: RetryPolicy): Builder {
+            this.retryPolicy = retryPolicy
             return this
         }
 
@@ -358,6 +507,11 @@ class ConnectionConfig private constructor(
                 endpointCacheSize = endpointCacheSize,
                 endpointCacheDisabled = endpointCacheDisabled,
                 disableMetrics = disableMetrics,
+                suppressCreateMetrics = false,
+                enableTracing = enableTracing,
+                retryPolicy = retryPolicy,
+                retryOnConnectionFailure = true,
+                singleAttemptHealthChecks = false,
             )
         }
     }

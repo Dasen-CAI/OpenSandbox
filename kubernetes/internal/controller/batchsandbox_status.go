@@ -38,6 +38,12 @@ type runtimeView struct {
 	resumeCompleted bool
 }
 
+const (
+	terminalPodFailedReason           = "PodFailed"
+	terminalContainerFailedReason     = "ContainerFailed"
+	terminalInitContainerFailedReason = "InitContainerFailed"
+)
+
 func setConditionInStatus(
 	status *sandboxv1alpha1.BatchSandboxStatus,
 	conditionType sandboxv1alpha1.BatchSandboxConditionType,
@@ -108,6 +114,9 @@ func applyBatchSandboxPhaseConditions(status *sandboxv1alpha1.BatchSandboxStatus
 }
 
 func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
+	if reason, message, failed := getTerminalPodFailureReasonAndMessage(pod); failed {
+		return reason, message, true
+	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.State.Waiting == nil {
 			continue
@@ -120,21 +129,82 @@ func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
 	return "", "", false
 }
 
+func getTerminalPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
+	if pod.Status.Phase != corev1.PodFailed {
+		return "", "", false
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.InitContainerStatuses[i], true); failed {
+			return reason, message, true
+		}
+	}
+	for i := range pod.Status.ContainerStatuses {
+		if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.ContainerStatuses[i], false); failed {
+			return reason, message, true
+		}
+	}
+
+	message := fmt.Sprintf("Pod %s entered Failed phase", pod.Name)
+	if pod.Status.Reason != "" {
+		message += fmt.Sprintf(" (%s)", pod.Status.Reason)
+	}
+	if pod.Status.Message != "" {
+		message += ": " + pod.Status.Message
+	}
+	return terminalPodFailedReason, message, true
+}
+
+func terminatedContainerFailure(pod *corev1.Pod, status *corev1.ContainerStatus, initContainer bool) (string, string, bool) {
+	terminated := status.State.Terminated
+	if terminated == nil || terminated.ExitCode == 0 {
+		return "", "", false
+	}
+
+	reason := terminalContainerFailedReason
+	kind := "container"
+	if initContainer {
+		reason = terminalInitContainerFailedReason
+		kind = "init container"
+	}
+	message := fmt.Sprintf("Pod %s %s %s exited with code %d", pod.Name, kind, status.Name, terminated.ExitCode)
+	if terminated.Reason != "" {
+		message += fmt.Sprintf(" (%s)", terminated.Reason)
+	}
+	if terminated.Message != "" {
+		message += ": " + terminated.Message
+	}
+	return reason, message, true
+}
+
 type podFailureSummary struct {
 	observed      int
 	failed        int
 	primaryReason string
 	samplePod     string
+	sampleDetail  string
 }
 
 func summarizePodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
+	return summarizePodFailuresWith(pods, getPodFailureReasonAndMessage, false)
+}
+
+func summarizeTerminalPodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
+	return summarizePodFailuresWith(pods, getTerminalPodFailureReasonAndMessage, true)
+}
+
+func summarizePodFailuresWith(
+	pods []*corev1.Pod,
+	detectFailure func(*corev1.Pod) (string, string, bool),
+	includeSampleDetail bool,
+) (podFailureSummary, bool) {
 	summary := podFailureSummary{observed: len(pods)}
 	reasonCounts := make(map[string]int)
 	firstPodByReason := make(map[string]string)
+	firstDetailByReason := make(map[string]string)
 	primaryCount := 0
 
 	for _, pod := range pods {
-		reason, _, failed := getPodFailureReasonAndMessage(pod)
+		reason, message, failed := detectFailure(pod)
 		if !failed {
 			continue
 		}
@@ -142,12 +212,16 @@ func summarizePodFailures(pods []*corev1.Pod) (podFailureSummary, bool) {
 		summary.failed++
 		if _, exists := firstPodByReason[reason]; !exists {
 			firstPodByReason[reason] = pod.Name
+			firstDetailByReason[reason] = message
 		}
 		reasonCounts[reason]++
 		if reasonCounts[reason] > primaryCount {
 			primaryCount = reasonCounts[reason]
 			summary.primaryReason = reason
 			summary.samplePod = firstPodByReason[reason]
+			if includeSampleDetail {
+				summary.sampleDetail = firstDetailByReason[reason]
+			}
 		}
 	}
 
@@ -159,7 +233,11 @@ func (s podFailureSummary) message(duringResume bool) string {
 	if duringResume {
 		scope = "observed pods failed during resume"
 	}
-	return fmt.Sprintf("%d/%d %s; primary reason=%s; sample pod=%s", s.failed, s.observed, scope, s.primaryReason, s.samplePod)
+	message := fmt.Sprintf("%d/%d %s; primary reason=%s; sample pod=%s", s.failed, s.observed, scope, s.primaryReason, s.samplePod)
+	if s.sampleDetail != "" {
+		message += "; sample detail=" + s.sampleDetail
+	}
+	return message
 }
 
 func buildRuntimeView(batchSbx *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod) runtimeView {
@@ -199,6 +277,14 @@ func buildRuntimeView(batchSbx *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod
 	}
 }
 
+// isResumeInFlight reports whether a resume request has been issued but not yet
+// acknowledged, mirroring the dispatch table's resume detection. It is used to
+// preserve resume failure semantics when the cached phase lags behind.
+func isResumeInFlight(batchSbx *sandboxv1alpha1.BatchSandbox) bool {
+	return batchSbx.Generation > batchSbx.Status.PauseObservedGeneration &&
+		batchSbx.Spec.Pause != nil && !*batchSbx.Spec.Pause
+}
+
 func applyResumingRuntimePhase(status *sandboxv1alpha1.BatchSandboxStatus, pods []*corev1.Pod) {
 	if summary, hasFailures := summarizePodFailures(pods); hasFailures {
 		setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionResumeFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(true))
@@ -213,9 +299,18 @@ func applyResumingRuntimePhase(status *sandboxv1alpha1.BatchSandboxStatus, pods 
 }
 
 func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *sandboxv1alpha1.BatchSandboxStatus, pods []*corev1.Pod) {
-	if summary, hasFailures := summarizePodFailures(pods); hasFailures {
+	summary, hasFailures := summarizePodFailures(pods)
+	if batchSbx.Status.Phase == "" || batchSbx.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePending {
+		summary, hasFailures = summarizeTerminalPodFailures(pods)
+	}
+	if hasFailures {
 		if batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhaseFailed {
 			setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionPodFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(false))
+			// Under informer lag a resume-in-progress failure can be observed while the
+			// cached phase is not Resuming; keep the resume failure semantics anyway.
+			if isResumeInFlight(batchSbx) {
+				setConditionInStatus(status, sandboxv1alpha1.BatchSandboxConditionResumeFailed, sandboxv1alpha1.ConditionTrue, summary.primaryReason, summary.message(true))
+			}
 			status.Phase = sandboxv1alpha1.BatchSandboxPhaseFailed
 		}
 		return
@@ -233,12 +328,41 @@ func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *san
 	status.Phase = sandboxv1alpha1.BatchSandboxPhasePending
 }
 
+func hasTerminalPodFailureCondition(conditions []sandboxv1alpha1.BatchSandboxCondition) bool {
+	for _, condition := range conditions {
+		if condition.Type != sandboxv1alpha1.BatchSandboxConditionPodFailed || condition.Status != sandboxv1alpha1.ConditionTrue {
+			continue
+		}
+		switch condition.Reason {
+		case terminalPodFailedReason, terminalContainerFailedReason, terminalInitContainerFailedReason:
+			return true
+		}
+	}
+	return false
+}
+
 // isInitialUnallocatedSandbox returns true when the sandbox has just been created
 // and no pods have been allocated yet. In this case we skip writing the initial
 // Pending status — the next reconcile after allocation will write Succeed directly.
 func isInitialUnallocatedSandbox(batchSbx *sandboxv1alpha1.BatchSandbox, view runtimeView) bool {
 	return view.status.Replicas == 0 && batchSbx.Status.Phase == "" &&
-		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0
+		batchSbx.Spec.Replicas != nil && *batchSbx.Spec.Replicas > 0 &&
+		!hasTrueBatchSandboxCondition(
+			view.status.Conditions,
+			sandboxv1alpha1.BatchSandboxConditionPoolAllocationPending,
+		)
+}
+
+func hasTrueBatchSandboxCondition(
+	conditions []sandboxv1alpha1.BatchSandboxCondition,
+	conditionType sandboxv1alpha1.BatchSandboxConditionType,
+) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType && condition.Status == sandboxv1alpha1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *BatchSandboxReconciler) persistRuntimeView(

@@ -45,7 +45,10 @@ from opensandbox_server.api.schema import (
     Snapshot,
     SnapshotFilter,
 )
-from opensandbox_server.services.constants import SandboxErrorCodes
+from opensandbox_server.services.constants import (
+    OPEN_SANDBOX_INGRESS_HEADER,
+    SandboxErrorCodes,
+)
 from opensandbox_server.services.factory import create_sandbox_service
 from opensandbox_server.services.snapshot_service import create_snapshot_service
 
@@ -67,10 +70,20 @@ snapshot_service = create_snapshot_service(sandbox_service)
     response_model_exclude_none=True,
     status_code=status.HTTP_202_ACCEPTED,
     responses={
-        202: {"description": "Sandbox creation accepted for asynchronous provisioning"},
+        202: {"description": "Sandbox created and provisioned successfully"},
         400: {"model": ErrorResponse, "description": "The request was invalid or malformed"},
         401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
         409: {"model": ErrorResponse, "description": "The operation conflicts with the current state"},
+        429: {
+            "model": ErrorResponse,
+            "description": "Pool capacity remained unavailable before the acquisition timeout",
+            "headers": {
+                "Retry-After": {
+                    "description": "Suggested delay in seconds before retrying",
+                    "schema": {"type": "integer", "minimum": 1},
+                }
+            },
+        },
         500: {"model": ErrorResponse, "description": "An unexpected server error occurred"},
     },
 )
@@ -580,5 +593,11 @@ def get_sandbox_endpoint(
             base_url = str(request.base_url).rstrip("/") + mount_prefix
         base_url = base_url.replace("https://", "").replace("http://", "")
         endpoint.endpoint = f"{base_url}/sandboxes/{sandbox_id}/proxy/{port}"
+        if endpoint.headers:
+            endpoint.headers = {
+                key: value
+                for key, value in endpoint.headers.items()
+                if key.lower() != OPEN_SANDBOX_INGRESS_HEADER.lower()
+            } or None
 
     return endpoint

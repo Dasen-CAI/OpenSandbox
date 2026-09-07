@@ -139,6 +139,32 @@ test("Sandbox.create forwards credentialProxy", async () => {
   assert.deepEqual(recordedRequests[0].credentialProxy, { enabled: true });
 });
 
+test("Sandbox.create forwards lifecycle hooks", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+  const lifecycle = {
+    preStart: { command: ["/opt/hooks/restore.sh"], timeoutSeconds: 120 },
+    periodic: [
+      {
+        name: "backup-home",
+        schedule: "@every 5m",
+        command: ["/opt/hooks/backup.sh"],
+      },
+    ],
+  };
+  const expectedLifecycle = structuredClone(lifecycle);
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    lifecycle,
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].lifecycle, expectedLifecycle);
+});
+
 test("Sandbox.create forwards windows platform values", async () => {
   const { adapterFactory, recordedRequests } = createAdapterFactory();
 
@@ -530,6 +556,78 @@ test("Sandbox.create metrics failure does not change create error", async () => 
     }),
     /timed out|unhealthy|Sandbox/
   );
+});
+
+test("Sandbox.create readiness timeout omits network configuration hints", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        throw new Error("connect ECONNREFUSED");
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    useServerProxy: false,
+    disableMetrics: true,
+  });
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.2,
+      healthCheckPollingInterval: 50,
+    }),
+    (err) => {
+      const message = String(err && err.message);
+      assert.match(message, /Sandbox health check timed out after/);
+      assert.match(message, /domain=http:\/\/127\.0\.0\.1:8080, useServerProxy=false/);
+      assert.match(message, /Last health check error: connect ECONNREFUSED/);
+      assert.doesNotMatch(message, /consider enabling useServerProxy=true/i);
+      assert.doesNotMatch(message, /Docker bridge|remote-network|\[docker\]\.host_ip/i);
+      return true;
+    }
+  );
+});
+
+test("Sandbox.create readiness timeout does not overshoot by a polling interval", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        return false;
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    disableMetrics: true,
+  });
+
+  const started = Date.now();
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.02,
+      healthCheckPollingInterval: 2000,
+    }),
+    /Sandbox health check timed out after 0\.02s/
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 500, `expected timeout in ~20ms, took ${elapsed}ms`);
 });
 
 test("Sandbox.create metrics synchronous throw does not change create error", async () => {

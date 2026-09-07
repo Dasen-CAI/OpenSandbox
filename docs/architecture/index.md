@@ -156,7 +156,13 @@ The lifecycle endpoint API returns the reachable address for a service port insi
 - A Kubernetes ingress gateway endpoint.
 - A server-proxied URL under `/sandboxes/{sandboxId}/proxy/{port}` when `use_server_proxy=true`.
 
-The server proxy supports HTTP and WebSocket traffic and is also integrated with optional renew-on-access behavior.
+Header-routed ingress endpoints include `OpenSandbox-Ingress-To` in their endpoint metadata.
+When the endpoint is rewritten to a server-proxied URL, the server removes only this
+ingress routing header and preserves other required endpoint headers.
+
+The server proxy supports HTTP and WebSocket traffic and is also integrated with optional renew-on-access behavior. For HTTP responses, it strips hop-by-hop headers and the backend `Server` header while preserving an origin `Date`; the server adds a current `Date` only when the response does not already contain one. A root-relative `Location` value that starts with a single `/` is rebased under the same sandbox proxy route, while absolute URLs, network-path references (`//host/path`), and ordinary path-relative values are forwarded unchanged.
+
+HTTP proxy responses preserve the sandbox service's status code, body, and `Content-Type`, including redirects and backend errors. The generated Server OpenAPI describes `200` and `default` responses with `*/*` and no fixed payload schema because the sandbox service controls the payload. Server-side validation and authentication still apply before forwarding; the explicit `422` validation response remains documented. These response declarations cover both root and `/v1` aliases, with and without a backend path, for every supported HTTP method.
 
 ## 4. Runtime Backends
 

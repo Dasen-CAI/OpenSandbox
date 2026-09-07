@@ -14,10 +14,17 @@
 
 import asyncio
 import gzip
+import warnings
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
+from starlette.types import Message
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close, CloseCode
 from websockets.typing import Origin
 
 import opensandbox_server.api.proxy as proxy_api
@@ -55,14 +62,26 @@ class _FakeStreamingResponse:
             yield chunk
 
     async def aclose(self):
+        await asyncio.sleep(0)
         self.aclose_called = True
+
+
+class _BlockingStreamingResponse(_FakeStreamingResponse):
+    def __init__(self) -> None:
+        super().__init__()
+        self.body_started = asyncio.Event()
+
+    async def aiter_raw(self):
+        self.body_started.set()
+        await asyncio.Future()
+        yield b"unreachable"
 
 
 class _FakeAsyncClient:
     def __init__(self):
         self.built = None
         self.response = _FakeStreamingResponse()
-        self.raise_connect_error = False
+        self.connection_error: httpx.RequestError | None = None
         self.raise_generic_error = False
 
     def build_request(
@@ -83,8 +102,8 @@ class _FakeAsyncClient:
         return self.built
 
     async def send(self, req, stream: bool = True):
-        if self.raise_connect_error:
-            raise httpx.ConnectError("connection refused")
+        if self.connection_error:
+            raise self.connection_error
         if self.raise_generic_error:
             raise RuntimeError("unexpected proxy error")
         return self.response
@@ -135,6 +154,344 @@ class _FakeWebSocketConnector:
         return _ContextManager()
 
 
+class _ClosingBackendWebSocket:
+    def __init__(
+        self,
+        close_exception: ConnectionClosedError | ConnectionClosedOK,
+    ) -> None:
+        self._messages: list[str | bytes] = ["backend-text", b"\x00\x01"]
+        self._close_exception = close_exception
+
+    async def recv(self) -> str | bytes:
+        if self._messages:
+            return self._messages.pop(0)
+        raise self._close_exception
+
+
+class _DisconnectingClientWebSocket:
+    """Client side that delivers one frame and then an ASGI ``websocket.disconnect``."""
+
+    def __init__(self, disconnect_code: int | None, reason: str = "") -> None:
+        message: dict[str, Any] = {"type": "websocket.disconnect", "reason": reason}
+        if disconnect_code is not None:
+            message["code"] = disconnect_code
+        self._messages: list[dict[str, Any]] = [
+            {"type": "websocket.receive", "text": "client-text"},
+            message,
+        ]
+
+    async def receive(self) -> dict[str, Any]:
+        return self._messages.pop(0)
+
+
+class _RecordingBackendWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[str | bytes] = []
+        self.close_calls: list[tuple[int, str]] = []
+
+    async def send(self, payload: str | bytes) -> None:
+        self.sent.append(payload)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        Close(code, reason).serialize()
+        self.close_calls.append((code, reason))
+
+
+class _RecordingClientWebSocket:
+    def __init__(self) -> None:
+        self.text_messages: list[str] = []
+        self.binary_messages: list[bytes] = []
+        self.close_calls: list[tuple[int, str]] = []
+
+    async def send_text(self, payload: str) -> None:
+        self.text_messages.append(payload)
+
+    async def send_bytes(self, payload: bytes) -> None:
+        self.binary_messages.append(payload)
+
+    async def close(self, code: int, reason: str = "") -> None:
+        Close(code, reason).serialize()
+        self.close_calls.append((code, reason))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_close", "expected_code", "expected_reason"),
+    [
+        (ConnectionClosedError(None, None), 1011, ""),
+        (
+            ConnectionClosedError(Close(CloseCode.NO_STATUS_RCVD, ""), None),
+            1011,
+            "",
+        ),
+        (ConnectionClosedOK(Close(1000, "normal"), None), 1000, "normal"),
+        (ConnectionClosedError(Close(4001, "application close"), None), 4001, "application close"),
+    ],
+)
+async def test_relay_backend_messages_maps_non_transmittable_close_code(
+    backend_close: ConnectionClosedError | ConnectionClosedOK,
+    expected_code: int,
+    expected_reason: str,
+) -> None:
+    websocket = _RecordingClientWebSocket()
+    backend = _ClosingBackendWebSocket(backend_close)
+    cancelled: list[bool] = []
+    cancel_scope = SimpleNamespace(cancel=lambda: cancelled.append(True))
+
+    await asyncio.wait_for(
+        proxy_api._relay_backend_messages(
+            cast(Any, websocket),
+            cast(Any, backend),
+            cast(Any, cancel_scope),
+        ),
+        timeout=0.5,
+    )
+
+    assert websocket.text_messages == ["backend-text"]
+    assert websocket.binary_messages == [b"\x00\x01"]
+    assert websocket.close_calls == [(expected_code, expected_reason)]
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize(
+    ("backend_code", "expected_code"),
+    [
+        (None, 1000),
+        (999, 1011),
+        (1000, 1000),
+        (1004, 1011),
+        (1005, 1011),
+        (1006, 1011),
+        (1011, 1011),
+        (1015, 1011),
+        (2999, 1011),
+        (3000, 3000),
+        (4001, 4001),
+        (4999, 4999),
+        (5000, 1011),
+    ],
+)
+def test_client_websocket_close_code_maps_only_transmittable_codes(
+    backend_code: int | None,
+    expected_code: int,
+) -> None:
+    assert proxy_api._client_websocket_close_code(backend_code) == expected_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disconnect_code", "expected_code"),
+    [
+        (1000, 1000),
+        (1001, 1001),
+        (4001, 4001),
+        (None, 1000),
+        (1005, 1000),
+        (1006, 1001),
+    ],
+)
+async def test_relay_client_messages_maps_non_transmittable_disconnect_code(
+    disconnect_code: int | None,
+    expected_code: int,
+) -> None:
+    websocket = _DisconnectingClientWebSocket(disconnect_code)
+    backend = _RecordingBackendWebSocket()
+    cancelled: list[bool] = []
+    cancel_scope = SimpleNamespace(cancel=lambda: cancelled.append(True))
+
+    await asyncio.wait_for(
+        proxy_api._relay_client_messages(
+            cast(Any, websocket),
+            cast(Any, backend),
+            cast(Any, cancel_scope),
+        ),
+        timeout=0.5,
+    )
+
+    assert backend.sent == ["client-text"]
+    assert backend.close_calls == [(expected_code, "")]
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize(
+    ("client_code", "expected_code"),
+    [
+        (None, 1000),
+        (999, 1001),
+        (1000, 1000),
+        (1004, 1001),
+        (1005, 1000),
+        (1006, 1001),
+        (1011, 1011),
+        (1015, 1001),
+        (2999, 1001),
+        (3000, 3000),
+        (4001, 4001),
+        (4999, 4999),
+        (5000, 1001),
+    ],
+)
+def test_backend_websocket_close_code_maps_only_transmittable_codes(
+    client_code: int | None,
+    expected_code: int,
+) -> None:
+    assert proxy_api._backend_websocket_close_code(client_code) == expected_code
+
+
+def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:
+    app = cast(Any, client.app)
+    app.openapi_schema = None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        schema = app.openapi()
+
+    proxy_paths = {
+        "/sandboxes/{sandbox_id}/proxy/{port}",
+        "/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+        "/v1/sandboxes/{sandbox_id}/proxy/{port}",
+        "/v1/sandboxes/{sandbox_id}/proxy/{port}/{full_path}",
+    }
+    proxy_methods = {"get", "post", "put", "delete", "patch"}
+    operation_ids = [
+        schema["paths"][path][method]["operationId"]
+        for path in proxy_paths
+        for method in proxy_methods
+    ]
+    duplicate_warnings = [
+        str(item.message)
+        for item in caught
+        if "Duplicate Operation ID" in str(item.message)
+        and "proxy_sandbox_endpoint" in str(item.message)
+    ]
+
+    assert len(operation_ids) == 20
+    assert len(set(operation_ids)) == len(operation_ids)
+    assert duplicate_warnings == []
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+@pytest.mark.parametrize("suffix", ["", "/{full_path}"])
+@pytest.mark.parametrize("method", ["get", "post", "put", "delete", "patch"])
+def test_proxy_openapi_describes_transparent_responses(
+    client: TestClient,
+    prefix: str,
+    suffix: str,
+    method: str,
+) -> None:
+    app = cast(Any, client.app)
+    app.openapi_schema = None
+    schema = app.openapi()
+    path = f"{prefix}/sandboxes/{{sandbox_id}}/proxy/{{port}}{suffix}"
+    responses = schema["paths"][path][method]["responses"]
+
+    for status_code in ("default", "200"):
+        assert responses[status_code]["description"]
+        assert responses[status_code]["content"] == {"*/*": {}}
+    assert responses["422"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}
+    }
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    [
+        "/sandboxes/sbx-123/proxy/44772",
+        "/sandboxes/sbx-123/proxy/44772/nested/path",
+        "/v1/sandboxes/sbx-123/proxy/44772",
+        "/v1/sandboxes/sbx-123/proxy/44772/nested/path",
+    ],
+)
+@pytest.mark.parametrize(
+    ("status_code", "content_type", "body"),
+    [
+        (200, "text/html; charset=utf-8", b"<h1>backend</h1>"),
+        (200, "text/event-stream", b"data: backend\n\n"),
+        (302, "text/plain; charset=utf-8", b"redirect"),
+        (405, "application/json", b'{"error":"backend method"}'),
+        (503, "application/octet-stream", b"\x00\xffbackend"),
+    ],
+)
+def test_proxy_preserves_backend_status_body_and_media_type(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    request_path: str,
+    status_code: int,
+    content_type: str,
+    body: bytes,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(
+            sandbox_id: str,
+            port: int,
+            resolve_internal: bool = False,
+            use_proxy_host: bool = False,
+        ) -> Endpoint:
+            return Endpoint(endpoint="127.0.0.1:44772")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=status_code,
+        headers={"content-type": content_type},
+        chunks=[body],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(request_path, headers=auth_headers, follow_redirects=False)
+
+    assert response.status_code == status_code
+    assert response.content == body
+    assert response.headers["content-type"] == content_type
+    assert fake_client.response.aclose_called is True
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+@pytest.mark.parametrize("suffix", ["", "/nested/path"])
+def test_proxy_invalid_port_preserves_validation_error(
+    client: TestClient,
+    auth_headers: dict,
+    prefix: str,
+    suffix: str,
+) -> None:
+    response = client.get(
+        f"{prefix}/sandboxes/sbx-123/proxy/not-a-port{suffix}", headers=auth_headers
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    [
+        "/sandboxes/sbx-123/proxy/44772",
+        "/sandboxes/sbx-123/proxy/44772/nested/path",
+        "/v1/sandboxes/sbx-123/proxy/44772",
+        "/v1/sandboxes/sbx-123/proxy/44772/nested/path",
+    ],
+)
+def test_proxy_method_not_allowed_lists_all_supported_methods(
+    client: TestClient,
+    auth_headers: dict,
+    request_path: str,
+) -> None:
+    response = client.options(
+        request_path,
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 405
+    assert set(response.headers["allow"].split(", ")) == {
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "PATCH",
+    }
+
+
 def test_proxy_forwards_filtered_headers_and_query(
     client: TestClient,
     auth_headers: dict,
@@ -142,7 +499,7 @@ def test_proxy_forwards_filtered_headers_and_query(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -208,6 +565,188 @@ def test_proxy_forwards_filtered_headers_and_query(
     assert fake_client.response.aclose_called is True
 
 
+def test_proxy_honors_configured_resolve_internal_false(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+):
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is False
+            assert use_proxy_host is True
+            return Endpoint(endpoint="127.0.0.1:51999")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        proxy_api,
+        "get_config",
+        lambda: SimpleNamespace(proxy=SimpleNamespace(resolve_internal=False)),
+    )
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=200,
+        headers={},
+        chunks=[b"ok"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get("/v1/sandboxes/sbx-123/proxy/44772/status", headers=auth_headers)
+    assert response.status_code == 200
+    assert fake_client.built is not None
+    assert fake_client.built["url"] == "http://127.0.0.1:51999/status"
+
+
+def test_proxy_preserves_origin_date_and_filters_server_header(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    origin_date = "Wed, 21 Oct 2015 07:28:00 GMT"
+    fake_client.response = _FakeStreamingResponse(
+        headers={
+            "Date": origin_date,
+            "Server": "backend-server",
+            "X-Backend": "yes",
+        },
+        chunks=[b"proxy-ok"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/proxy/44772",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.headers.get("x-backend") == "yes"
+    assert response.headers.get("date") == origin_date
+    assert "server" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("request_path", "location", "expected_location"),
+    [
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "/login?next=%2F",
+            "/v1/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        (
+            "/sandboxes/sbx-123/proxy/44772/",
+            "/login?next=%2F",
+            "/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/nested/page",
+            "/login?next=%2F",
+            "/v1/sandboxes/sbx-123/proxy/44772/login?next=%2F",
+        ),
+        ("/v1/sandboxes/sbx-123/proxy/44772/", "login?next=%2F", "login?next=%2F"),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "https://example.com/login",
+            "https://example.com/login",
+        ),
+        (
+            "/v1/sandboxes/sbx-123/proxy/44772/",
+            "//example.com/login",
+            "//example.com/login",
+        ),
+        ("/v1/sandboxes/sbx-123/proxy/44772/", "?next=%2F", "?next=%2F"),
+    ],
+)
+def test_proxy_rewrites_only_root_relative_redirects(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    request_path: str,
+    location: str,
+    expected_location: str,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=302,
+        headers={"Location": location},
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        request_path,
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == expected_location
+
+
+def test_proxy_rewrites_root_relative_redirect_with_server_eip_path(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            assert sandbox_id == "sbx-123"
+            assert port == 44772
+            assert resolve_internal is True
+            return Endpoint(endpoint="backend.example:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        lifecycle,
+        "get_config",
+        lambda: SimpleNamespace(
+            server=SimpleNamespace(eip="sandbox.example.com/opensandbox/")
+        ),
+    )
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=302,
+        headers={"Location": "/login?next=%2F"},
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/proxy/44772/",
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert (
+        response.headers["location"]
+        == "/opensandbox/sandboxes/sbx-123/proxy/44772/login?next=%2F"
+    )
+
+
 def test_proxy_root_path_forwards_endpoint_headers_and_query(
     client: TestClient,
     auth_headers: dict,
@@ -215,7 +754,7 @@ def test_proxy_root_path_forwards_endpoint_headers_and_query(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -256,7 +795,7 @@ def test_proxy_rejects_missing_secure_access_header(
     """Regression test: requests without the required secure-access token are rejected."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -292,7 +831,7 @@ def test_proxy_rejects_mismatched_secure_access_header(
     """Regression test: requests with a wrong secure-access token are rejected."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -330,7 +869,7 @@ def test_proxy_allows_valid_secure_access_header(
     """Valid secure-access token passes; header is stripped from forwarded request."""
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -357,6 +896,7 @@ def test_proxy_allows_valid_secure_access_header(
     )
 
     assert response.status_code == 200
+    assert fake_client.built is not None
     lowered_headers = {
         key.lower(): value for key, value in fake_client.built["headers"].items()
     }
@@ -379,7 +919,7 @@ def test_proxy_forwards_get_request_with_query_params(
     """
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -421,7 +961,7 @@ def test_proxy_forwards_delete_request_with_body(
     """
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -454,7 +994,7 @@ def test_proxy_filters_response_hop_by_hop_headers(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:40109")
 
@@ -495,7 +1035,7 @@ def test_proxy_streams_raw_body_for_content_encoded_response(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:40109")
 
@@ -528,6 +1068,79 @@ def test_proxy_streams_raw_body_for_content_encoded_response(
     assert fake_client.response.aclose_called is True
 
 
+def test_proxy_closes_backend_response_when_downstream_rejects_headers() -> None:
+    """A disconnect before body iteration must not retain the backend connection."""
+
+    async def run() -> None:
+        backend_response = _FakeStreamingResponse()
+        response = proxy_api._ProxyStreamingResponse(
+            cast(httpx.Response, backend_response),
+            status_code=200,
+            headers={},
+        )
+
+        async def receive() -> Message:
+            return {"type": "http.disconnect"}
+
+        async def reject_response_start(message: Message) -> None:
+            assert message["type"] == "http.response.start"
+            raise ConnectionError("downstream disconnected")
+
+        try:
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}},
+                receive,
+                reject_response_start,
+            )
+        except ClientDisconnect:
+            pass
+        else:
+            raise AssertionError("expected the downstream send to fail")
+
+        assert backend_response.aclose_called is True
+
+    asyncio.run(run())
+
+
+def test_proxy_closes_backend_response_when_stream_is_cancelled() -> None:
+    """Task cancellation must not interrupt returning the backend connection."""
+
+    async def run() -> None:
+        backend_response = _BlockingStreamingResponse()
+        response = proxy_api._ProxyStreamingResponse(
+            cast(httpx.Response, backend_response),
+            status_code=200,
+            headers={},
+        )
+
+        async def send(message: Message) -> None:
+            return None
+
+        async def receive() -> Message:
+            return {"type": "http.disconnect"}
+
+        task = asyncio.create_task(
+            response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}},
+                receive,
+                send,
+            )
+        )
+        await backend_response.body_started.wait()
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("expected stream task cancellation")
+
+        assert backend_response.aclose_called is True
+
+    asyncio.run(run())
+
+
 def test_proxy_rejects_websocket_upgrade(
     client: TestClient,
     auth_headers: dict,
@@ -535,7 +1148,7 @@ def test_proxy_rejects_websocket_upgrade(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -557,7 +1170,7 @@ def test_proxy_rejects_websocket_upgrade_for_post_and_mixed_case_header(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -580,7 +1193,7 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert sandbox_id == "sbx-123"
             assert port == 44772
             assert resolve_internal is True
@@ -639,19 +1252,24 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     assert lowered_headers["x-trace"] == "trace-ws"
 
 
-def test_proxy_maps_connect_error_to_502(
+@pytest.mark.parametrize(
+    "connection_error",
+    [httpx.ConnectError("connection refused"), httpx.ConnectTimeout("connection timed out")],
+)
+def test_proxy_maps_connect_failure_to_502(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
+    connection_error: httpx.RequestError,
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
     fake_client = _FakeAsyncClient()
-    fake_client.raise_connect_error = True
+    fake_client.connection_error = connection_error
     _set_http_client(client, fake_client)
 
     response = client.get(
@@ -660,7 +1278,9 @@ def test_proxy_maps_connect_error_to_502(
     )
 
     assert response.status_code == 502
-    assert "Could not connect to the backend sandbox" in response.json()["message"]
+    payload = response.json()
+    assert payload["code"] == "BACKEND_CONNECTION_FAILED"
+    assert "Could not connect to the backend sandbox" in payload["message"]
 
 
 def test_proxy_maps_unexpected_error_to_500(
@@ -670,7 +1290,7 @@ def test_proxy_maps_unexpected_error_to_500(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             return Endpoint(endpoint="10.57.1.91:40109")
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
@@ -694,7 +1314,7 @@ def test_proxy_forwards_18080_without_server_side_egress_auth_check(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(
@@ -731,7 +1351,7 @@ def test_proxy_forwards_egress_auth_header_for_18080(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:18080")
@@ -764,7 +1384,7 @@ def test_proxy_active_credential_vault_returns_sidecar_forbidden(
 ) -> None:
     class StubService:
         @staticmethod
-        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
             assert port == 18080
             assert resolve_internal is True
             return Endpoint(endpoint="10.57.1.91:18080")

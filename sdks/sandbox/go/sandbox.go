@@ -54,6 +54,9 @@ type SandboxCreateOptions struct {
 	// Metadata for filtering and tagging.
 	Metadata map[string]string
 
+	// Lifecycle contains optional pre-start and periodic hooks.
+	Lifecycle *SandboxLifecycle
+
 	// NetworkPolicy for egress control.
 	NetworkPolicy *NetworkPolicy
 
@@ -147,6 +150,7 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 		Env:              opts.Env,
 		SecureAccess:     opts.SecureAccess,
 		Metadata:         opts.Metadata,
+		Lifecycle:        opts.Lifecycle,
 		NetworkPolicy:    opts.NetworkPolicy,
 		CredentialProxy:  opts.CredentialProxy,
 		Volumes:          opts.Volumes,
@@ -365,10 +369,16 @@ func (s *Sandbox) WaitUntilReady(ctx context.Context, opts ReadyOptions) error {
 			return nil
 		}
 
+		// Clamp the sleep to the remaining budget so the final failed check
+		// does not overshoot the timeout by a full polling interval.
+		wait := interval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(interval):
+		case <-time.After(wait):
 		}
 	}
 

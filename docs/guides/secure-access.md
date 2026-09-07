@@ -26,7 +26,7 @@ Normative design: [OSEP-0011](https://github.com/opensandbox-group/OpenSandbox/b
 
 ## How It Works
 
-![Secure Access request flow](/images/secure-access.svg)
+![Secure Access request flow](../public/images/secure-access.svg)
 
 On the **control plane**, creating a sandbox with `secureAccess: true` and
 calling `GetEndpoint` yields a per-sandbox opaque `SecureAccessToken`.
@@ -112,6 +112,12 @@ key = "<base64-encoded-secret>"   # raw base64, no "base64:" prefix
 The `opensandbox-server` Helm chart exposes the same shape under
 `server.gateway.secureAccess` and wires the keys into both the server and the
 ingress gateway.
+
+To keep key material out of the config file, the server also accepts the
+`OPENSANDBOX_SECURE_ACCESS_KEYS` (`a=<base64-secret>[,b=...]`) and
+`OPENSANDBOX_SECURE_ACCESS_ACTIVE_KEY` (`a`) environment variables, which
+override the TOML block; the chart's
+`server.gateway.secureAccess.existingSecret` option sources them from a Secret.
 
 **Key rotation.** Add a new key entry, deploy, then flip `active_key`.
 Verification loads every configured key, so tokens signed by older keys stay

@@ -19,6 +19,7 @@ using OpenSandbox.Core;
 using OpenSandbox.Factory;
 using OpenSandbox.Models;
 using OpenSandbox.Services;
+using System.Diagnostics;
 using Xunit;
 
 namespace OpenSandbox.Tests;
@@ -26,7 +27,39 @@ namespace OpenSandbox.Tests;
 public class SandboxReadinessDiagnosticsTests
 {
     [Fact]
-    public async Task WaitUntilReadyAsync_WhenHealthCheckThrows_IncludesLastErrorAndConnectionContext()
+    public async Task WaitUntilReadyAsync_WhenTimeoutIsShorterThanPollingInterval_DoesNotOvershoot()
+    {
+        // Arrange
+        var healthMock = new Mock<IExecdHealth>();
+        healthMock
+            .Setup(x => x.PingAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var sandbox = await CreateSandboxForReadinessTestAsync(healthMock, useServerProxy: true);
+        var stopwatch = Stopwatch.StartNew();
+
+        // Act
+        try
+        {
+            Func<Task> action = async () =>
+                await sandbox.WaitUntilReadyAsync(new WaitUntilReadyOptions
+                {
+                    ReadyTimeoutSeconds = 1,
+                    PollingIntervalMillis = 5_000
+                });
+
+            // Assert
+            await action.Should().ThrowAsync<SandboxReadyTimeoutException>();
+            stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            await sandbox.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task WaitUntilReadyAsync_WhenHealthCheckThrows_OmitsNetworkConfigurationHints()
     {
         // Arrange
         var healthMock = new Mock<IExecdHealth>();
@@ -52,8 +85,10 @@ public class SandboxReadinessDiagnosticsTests
             ex.Which.Message.Should().Contain("Last health check error");
             ex.Which.Message.Should().Contain("domain=localhost:8080");
             ex.Which.Message.Should().Contain("useServerProxy=False");
-            ex.Which.Message.Should().Contain("useServerProxy=true");
-            ex.Which.Message.Should().Contain("[docker].host_ip");
+            ex.Which.Message.Should().NotContainEquivalentOf("consider enabling useServerProxy=true");
+            ex.Which.Message.Should().NotContainEquivalentOf("Docker bridge");
+            ex.Which.Message.Should().NotContainEquivalentOf("remote-network");
+            ex.Which.Message.Should().NotContain("[docker].host_ip");
         }
         finally
         {

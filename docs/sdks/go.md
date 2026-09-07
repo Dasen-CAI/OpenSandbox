@@ -296,8 +296,39 @@ pool, err := opensandbox.NewSandboxPoolBuilder().
 - All nodes sharing one pool must use the same creation and warmup definition. If that definition changes, use a new `PoolName` or key prefix and drain the old pool.
 - `Resize(ctx, maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile.
 - Use `Resize(ctx, 0)` and wait for `Snapshot().IdleCount == 0` to drain a distributed idle buffer. `ReleaseAllIdle()` is only a best-effort cleanup pass in distributed mode.
+- `ReleaseAllIdle(ctx)` preserves fire-and-forget kill scheduling. Call
+  `ReleaseAllIdleParallel(ctx, maxWorkers)` on `*DefaultSandboxPool` for bounded
+  parallel cleanup that waits for every drained ID to receive a kill attempt.
+  `maxWorkers` must be positive; the method is not part of the `SandboxPool` interface.
 - Configure `PrimaryLockTTL` greater than `WarmupReadyTimeout` plus expected warmup preparer time.
 :::
+
+## Lifecycle Hooks
+
+Set `Lifecycle` in `SandboxCreateOptions`. `PreStart` completes before the entrypoint starts, while `Periodic` hooks run on their schedules after startup.
+
+```go
+hookTimeout := 120
+sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    Image: "ubuntu:24.04",
+    Lifecycle: &opensandbox.SandboxLifecycle{
+        PreStart: &opensandbox.LifecycleHook{
+            Command:        []string{"sh", "-c", "echo ready > /tmp/prestart.done"},
+            TimeoutSeconds: &hookTimeout,
+        },
+        Periodic: []opensandbox.PeriodicLifecycleHook{
+            {
+                Name:           "checkpoint",
+                Schedule:       "@every 5m",
+                Command:        []string{"sh", "-c", "date -u >> /tmp/checkpoints.log"},
+                TimeoutSeconds: &hookTimeout,
+            },
+        },
+    },
+})
+```
+
+The Server validates `TimeoutSeconds`; `PreStart` accepts 1–10800 seconds, while `Periodic` accepts 1–300 seconds. Both default to 60 seconds when omitted. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
 
 ## API Reference
 

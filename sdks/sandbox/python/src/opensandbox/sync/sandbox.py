@@ -42,6 +42,7 @@ from opensandbox.models.sandboxes import (
     SandboxEndpoint,
     SandboxImageSpec,
     SandboxInfo,
+    SandboxLifecycle,
     SandboxMetrics,
     SandboxRenewResponse,
     SnapshotInfo,
@@ -441,11 +442,11 @@ class SandboxSync:
             f"Waiting for sandbox {self.id} to pass health check (timeout: {timeout.total_seconds()}s)"
         )
 
-        deadline = time.time() + timeout.total_seconds()
+        deadline = time.monotonic() + timeout.total_seconds()
         attempt = 0
         last_exception: Exception | None = None
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             attempt += 1
             logger.debug(f"Health check attempt #{attempt} for sandbox {self.id}")
             try:
@@ -458,7 +459,10 @@ class SandboxSync:
             except Exception as e:
                 last_exception = e
 
-            time.sleep(polling_interval.total_seconds())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(polling_interval.total_seconds(), remaining))
 
         error_detail = (
             f"Last error: {last_exception}"
@@ -469,21 +473,9 @@ class SandboxSync:
             f"ConnectionConfig(domain={self.connection_config.get_domain()}, "
             f"use_server_proxy={self.connection_config.use_server_proxy})"
         )
-        if self.connection_config.use_server_proxy:
-            hint = (
-                "Hint: server proxy mode is enabled. Check server-to-sandbox connectivity "
-                "and server API key/auth configuration."
-            )
-        else:
-            hint = (
-                "Hint: direct sandbox endpoint access is enabled. If the SDK cannot directly "
-                "reach sandbox network/ports, set ConnectionConfigSync(use_server_proxy=True). "
-                "For Docker bridge deployments where server runs in a container, also configure "
-                "server [docker].host_ip to a host-reachable address."
-            )
         final_message = (
             f"Sandbox health check timed out after {timeout.total_seconds()}s "
-            f"({attempt} attempts). {error_detail}. {connection_detail}. {hint}"
+            f"({attempt} attempts). {error_detail}. {connection_detail}."
         )
         logger.error(final_message)
         raise SandboxReadyTimeoutException(final_message)
@@ -511,6 +503,7 @@ class SandboxSync:
         health_check: Callable[["SandboxSync"], bool] | None = None,
         health_check_polling_interval: timedelta = timedelta(milliseconds=200),
         skip_health_check: bool = False,
+        lifecycle: SandboxLifecycle | None = None,
     ) -> "SandboxSync":
         """
         Create a new sandbox instance with the specified configuration (blocking).
@@ -533,6 +526,7 @@ class SandboxSync:
             health_check: Custom sync health check function
             health_check_polling_interval: Time between health check attempts
             skip_health_check: If True, do NOT wait for sandbox readiness/health; returned instance may not be ready yet.
+            lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
             Fully configured and ready SandboxSync instance
@@ -586,6 +580,7 @@ class SandboxSync:
                 secure_access=secure_access,
                 snapshot_id=snapshot_id,
                 resource_requests=resource_requests,
+                lifecycle=lifecycle,
             )
             sandbox_id = response.id
             execd_endpoint = sandbox_service.get_sandbox_endpoint(

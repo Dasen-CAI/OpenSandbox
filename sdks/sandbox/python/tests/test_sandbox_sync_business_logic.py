@@ -24,7 +24,13 @@ from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.constants import DEFAULT_EGRESS_PORT, DEFAULT_EXECD_PORT
 from opensandbox.exceptions import SandboxReadyTimeoutException
 from opensandbox.models.diagnostics import DiagnosticContent
-from opensandbox.models.sandboxes import NetworkPolicy, NetworkRule, SandboxEndpoint
+from opensandbox.models.sandboxes import (
+    LifecycleHook,
+    NetworkPolicy,
+    NetworkRule,
+    SandboxEndpoint,
+    SandboxLifecycle,
+)
 from opensandbox.sync.sandbox import SandboxSync
 
 
@@ -84,7 +90,84 @@ class _DiagnosticsServiceStub:
         )
 
 
-def test_sync_check_ready_timeout_message_includes_troubleshooting_hints() -> None:
+def test_sync_check_ready_limits_final_sleep_to_remaining_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    sleep_calls: list[float] = []
+
+    def _monotonic() -> float:
+        return clock[0]
+
+    def _sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr("opensandbox.sync.sandbox.time.time", _monotonic)
+    monkeypatch.setattr("opensandbox.sync.sandbox.time.monotonic", _monotonic)
+    monkeypatch.setattr("opensandbox.sync.sandbox.time.sleep", _sleep)
+    sbx = SandboxSync(
+        sandbox_id=str(uuid4()),
+        sandbox_service=_Noop(),
+        filesystem_service=_Noop(),
+        command_service=_Noop(),
+        health_service=_Noop(),
+        metrics_service=_Noop(),
+        egress_service=_EgressServiceStub(),
+        diagnostics_service=_DiagnosticsServiceStub(),
+        connection_config=ConnectionConfigSync(),
+        custom_health_check=lambda _: False,
+    )
+
+    with pytest.raises(SandboxReadyTimeoutException):
+        sbx.check_ready(
+            timeout=timedelta(milliseconds=10),
+            polling_interval=timedelta(milliseconds=200),
+        )
+
+    assert sleep_calls == [0.01]
+
+
+def test_sync_check_ready_succeeds_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    sleep_calls: list[float] = []
+    calls = {"n": 0}
+
+    def _monotonic() -> float:
+        return clock[0]
+
+    def _sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock[0] += seconds
+
+    def _healthy_after_two_failures(_: SandboxSync) -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    monkeypatch.setattr("opensandbox.sync.sandbox.time.monotonic", _monotonic)
+    monkeypatch.setattr("opensandbox.sync.sandbox.time.sleep", _sleep)
+    sbx = SandboxSync(
+        sandbox_id=str(uuid4()),
+        sandbox_service=_Noop(),
+        filesystem_service=_Noop(),
+        command_service=_Noop(),
+        health_service=_Noop(),
+        metrics_service=_Noop(),
+        egress_service=_EgressServiceStub(),
+        diagnostics_service=_DiagnosticsServiceStub(),
+        connection_config=ConnectionConfigSync(),
+        custom_health_check=_healthy_after_two_failures,
+    )
+
+    sbx.check_ready(timeout=timedelta(seconds=1), polling_interval=timedelta(seconds=0.01))
+
+    assert calls["n"] == 3
+    assert sleep_calls == [0.01, 0.01]
+
+
+def test_sync_check_ready_timeout_message_omits_network_configuration_hints() -> None:
     def _always_false(_: SandboxSync) -> bool:
         return False
 
@@ -109,7 +192,9 @@ def test_sync_check_ready_timeout_message_includes_troubleshooting_hints() -> No
 
     message = str(exc_info.value)
     assert "ConnectionConfig(domain=10.0.0.2:8080, use_server_proxy=False)" in message
-    assert "ConnectionConfigSync(use_server_proxy=True)" in message
+    assert "set connectionconfigsync(use_server_proxy=true)" not in message.lower()
+    assert "direct sandbox endpoint access" not in message
+    assert "[docker].host_ip" not in message
 
 
 def test_sync_get_egress_policy_uses_injected_egress_service() -> None:
@@ -277,6 +362,7 @@ def test_sync_create_passes_new_signature_keywords_even_when_unused(
             snapshot_id=None,
             credential_proxy=None,
             resource_requests=None,
+            lifecycle=None,
         ):
             assert spec is not None
             assert entrypoint is not None
@@ -290,6 +376,9 @@ def test_sync_create_passes_new_signature_keywords_even_when_unused(
             assert platform is None
             assert secure_access is False
             assert snapshot_id is None
+            assert lifecycle is not None
+            assert lifecycle.pre_start is not None
+            assert lifecycle.pre_start.command == ["/opt/hooks/restore.sh"]
             return _CreateResponse()
 
         def get_sandbox_endpoint(self, _sandbox_id, port: int, _use_server_proxy: bool = False):
@@ -332,6 +421,9 @@ def test_sync_create_passes_new_signature_keywords_even_when_unused(
         network_policy=NetworkPolicy(
             defaultAction="deny",
             egress=[NetworkRule(action="allow", target="pypi.org")],
+        ),
+        lifecycle=SandboxLifecycle(
+            preStart=LifecycleHook(command=["/opt/hooks/restore.sh"])
         ),
         skip_health_check=True,
     )
@@ -427,6 +519,7 @@ def test_sync_create_restore_from_snapshot_passes_snapshot_id(
             snapshot_id=None,
             credential_proxy=None,
             resource_requests=None,
+            lifecycle=None,
         ):
             assert isinstance(env, dict)
             assert isinstance(metadata, dict)
@@ -503,6 +596,7 @@ def test_sync_create_restore_from_snapshot_preserves_custom_entrypoint(
             snapshot_id=None,
             credential_proxy=None,
             resource_requests=None,
+            lifecycle=None,
         ):
             assert isinstance(env, dict)
             assert isinstance(metadata, dict)

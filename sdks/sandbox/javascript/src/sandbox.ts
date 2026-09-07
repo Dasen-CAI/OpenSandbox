@@ -45,6 +45,7 @@ import type {
   RenewSandboxExpirationResponse,
   SandboxId,
   SandboxInfo,
+  SandboxLifecycle,
   SandboxMetadataPatch,
   Volume,
 } from "./models/sandboxes.js";
@@ -172,6 +173,10 @@ export interface SandboxCreateOptions {
    */
   extensions?: Record<string, string>;
   /**
+   * Optional declarative lifecycle hooks executed inside the sandbox.
+   */
+  lifecycle?: SandboxLifecycle;
+  /**
    * Optional runtime platform constraint used for provisioning.
    */
   platform?: PlatformSpec;
@@ -196,6 +201,10 @@ export interface SandboxCreateOptions {
    * Sandbox timeout in seconds. Set to `null` to require explicit cleanup.
    */
   timeoutSeconds?: number | null;
+  /**
+   * Optional signal used to cancel creation and readiness requests.
+   */
+  signal?: AbortSignal;
 
   /**
    * Skip readiness checks during create/connect.
@@ -245,10 +254,32 @@ export interface SandboxConnectOptions {
    * Polling interval for readiness checks (milliseconds).
    */
   healthCheckPollingInterval?: number;
+  /**
+   * Optional signal used to cancel connection and readiness requests.
+   */
+  signal?: AbortSignal;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function throwIfAborted(signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  throwIfAborted(signal);
+
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function toImageSpec(
@@ -363,6 +394,7 @@ export class Sandbox {
         }
       }
     }
+    throwIfAborted(opts.signal);
 
     const baseConnectionConfig =
       opts.connectionConfig instanceof ConnectionConfig
@@ -412,6 +444,7 @@ export class Sandbox {
       credentialProxy: opts.credentialProxy,
       volumes: opts.volumes,
       extensions: opts.extensions ?? {},
+      lifecycle: opts.lifecycle,
       platform: opts.platform,
     };
     if (timeoutSeconds !== null) {
@@ -425,18 +458,20 @@ export class Sandbox {
         : opts.image?.uri ?? opts.snapshotId;
     const createStarted = Date.now();
     try {
-      const created = await sandboxes.createSandbox(req);
+      const created = await sandboxes.createSandbox(req, opts.signal);
       sandboxId = created.id as SandboxId;
 
       const endpoint = await sandboxes.getSandboxEndpoint(
         sandboxId,
         DEFAULT_EXECD_PORT,
-        connectionConfig.useServerProxy
+        connectionConfig.useServerProxy,
+        opts.signal,
       );
       const egressEndpoint = await sandboxes.getSandboxEndpoint(
         sandboxId,
         DEFAULT_EGRESS_PORT,
-        connectionConfig.useServerProxy
+        connectionConfig.useServerProxy,
+        opts.signal,
       );
       const execdBaseUrl = `${connectionConfig.protocol}://${endpoint.endpoint}`;
       const egressBaseUrl = `${connectionConfig.protocol}://${egressEndpoint.endpoint}`;
@@ -479,6 +514,7 @@ export class Sandbox {
             opts.healthCheckPollingInterval ??
             DEFAULT_HEALTH_CHECK_POLLING_INTERVAL_MILLIS,
           healthCheck: opts.healthCheck,
+          signal: opts.signal,
         });
       }
 
@@ -497,6 +533,20 @@ export class Sandbox {
         createDurationMs: Date.now() - createStarted,
         success: false,
       });
+      if (opts.signal?.aborted) {
+        void (async () => {
+          try {
+            if (sandboxId) {
+              await sandboxes.deleteSandbox(sandboxId);
+            }
+          } catch {
+            // Best-effort cleanup after cancellation.
+          } finally {
+            await connectionConfig.closeTransport().catch(() => undefined);
+          }
+        })();
+        throw err;
+      }
       if (sandboxId) {
         try {
           await sandboxes.deleteSandbox(sandboxId);
@@ -510,6 +560,7 @@ export class Sandbox {
   }
 
   static async connect(opts: SandboxConnectOptions): Promise<Sandbox> {
+    throwIfAborted(opts.signal);
     const baseConnectionConfig =
       opts.connectionConfig instanceof ConnectionConfig
         ? opts.connectionConfig
@@ -533,12 +584,14 @@ export class Sandbox {
       const endpoint = await sandboxes.getSandboxEndpoint(
         opts.sandboxId,
         DEFAULT_EXECD_PORT,
-        connectionConfig.useServerProxy
+        connectionConfig.useServerProxy,
+        opts.signal,
       );
       const egressEndpoint = await sandboxes.getSandboxEndpoint(
         opts.sandboxId,
         DEFAULT_EGRESS_PORT,
-        connectionConfig.useServerProxy
+        connectionConfig.useServerProxy,
+        opts.signal,
       );
       const execdBaseUrl = `${connectionConfig.protocol}://${endpoint.endpoint}`;
       const egressBaseUrl = `${connectionConfig.protocol}://${egressEndpoint.endpoint}`;
@@ -580,11 +633,16 @@ export class Sandbox {
             opts.healthCheckPollingInterval ??
             DEFAULT_HEALTH_CHECK_POLLING_INTERVAL_MILLIS,
           healthCheck: opts.healthCheck,
+          signal: opts.signal,
         });
       }
 
       return sbx;
     } catch (err) {
+      if (opts.signal?.aborted) {
+        void connectionConfig.closeTransport().catch(() => undefined);
+        throw err;
+      }
       await connectionConfig.closeTransport();
       throw err;
     }
@@ -731,6 +789,7 @@ export class Sandbox {
     readyTimeoutSeconds: number;
     pollingIntervalMillis: number;
     healthCheck?: (sbx: Sandbox) => boolean | Promise<boolean>;
+    signal?: AbortSignal;
   }): Promise<void> {
     const deadline = Date.now() + opts.readyTimeoutSeconds * 1000;
     let attempt = 0;
@@ -738,40 +797,42 @@ export class Sandbox {
 
     const buildTimeoutMessage = () => {
       const context = `domain=${this.connectionConfig.domain}, useServerProxy=${this.connectionConfig.useServerProxy}`;
-      let suggestion =
-        "If this sandbox runs in Docker bridge or remote-network mode, consider enabling useServerProxy=true.";
-      if (!this.connectionConfig.useServerProxy) {
-        suggestion += " You can also configure server-side [docker].host_ip for direct endpoint access.";
-      }
-      return `Sandbox health check timed out after ${opts.readyTimeoutSeconds}s (${attempt} attempts). ${errorDetail} Connection context: ${context}. ${suggestion}`;
+      return `Sandbox health check timed out after ${opts.readyTimeoutSeconds}s (${attempt} attempts). ${errorDetail} Connection context: ${context}.`;
     };
 
     // Wait until execd becomes reachable and passes health check.
     while (true) {
-      if (Date.now() > deadline) {
-        throw new SandboxReadyTimeoutException({
-          message: buildTimeoutMessage(),
-        });
-      }
+      throwIfAborted(opts.signal);
+      if (Date.now() >= deadline) break;
       attempt++;
       try {
         if (opts.healthCheck) {
           const ok = await opts.healthCheck(this);
+          throwIfAborted(opts.signal);
           if (ok) {
             return;
           }
         } else {
-          const ok = await this.health.ping();
+          const ok = await this.health.ping(opts.signal);
+          throwIfAborted(opts.signal);
           if (ok) {
             return;
           }
         }
         errorDetail = "Health check returned false continuously.";
       } catch (err) {
+        throwIfAborted(opts.signal);
         const message = err instanceof Error ? err.message : String(err);
         errorDetail = `Last health check error: ${message}`;
       }
-      await sleep(opts.pollingIntervalMillis);
+      // Clamp the sleep to the remaining budget so the final failed check
+      // does not overshoot the timeout by a full polling interval.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(opts.pollingIntervalMillis, remaining), opts.signal);
     }
+    throw new SandboxReadyTimeoutException({
+      message: buildTimeoutMessage(),
+    });
   }
 }

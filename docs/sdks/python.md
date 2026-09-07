@@ -247,11 +247,48 @@ For async pools, pass a `redis.asyncio` client to `AsyncRedisPoolStateStore`.
   idle buffer. `release_all_idle()` is only a best-effort cleanup pass in distributed
   mode because another primary may put new idle sandboxes concurrently unless the
   shared target has already been reduced.
+- `release_all_idle()` preserves serial cleanup. Use
+  `release_all_idle_parallel(max_workers=50)` for bounded parallel cleanup. The
+  worker count must be positive, and the call waits for every drained ID to receive
+  a best-effort kill attempt.
 - Configure `primary_lock_ttl` greater than `warmup_ready_timeout` plus expected
   warmup preparer time and buffer.
 - Redis outages are surfaced as pool state store errors. The pool fails closed; it
   does not bypass shared state.
 :::
+
+## Lifecycle Hooks
+
+Pass a `SandboxLifecycle` when creating a sandbox. `pre_start` completes before the entrypoint starts, while `periodic` hooks run on their schedules after startup.
+
+```python
+from opensandbox.models.sandboxes import (
+    LifecycleHook,
+    PeriodicLifecycleHook,
+    SandboxLifecycle,
+)
+
+sandbox = await Sandbox.create(
+    "ubuntu:24.04",
+    connection_config=config,
+    lifecycle=SandboxLifecycle(
+        pre_start=LifecycleHook(
+            command=["sh", "-c", "echo ready > /tmp/prestart.done"],
+            timeout_seconds=120,
+        ),
+        periodic=[
+            PeriodicLifecycleHook(
+                name="checkpoint",
+                schedule="@every 5m",
+                command=["sh", "-c", "date -u >> /tmp/checkpoints.log"],
+                timeout_seconds=120,
+            )
+        ],
+    ),
+)
+```
+
+The Server validates `timeout_seconds`; `pre_start` accepts 1–10800 seconds, while `periodic` accepts 1–300 seconds. Both default to 60 seconds when omitted. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
 
 ## Usage Examples
 

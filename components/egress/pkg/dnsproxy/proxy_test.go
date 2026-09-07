@@ -15,7 +15,9 @@
 package dnsproxy
 
 import (
+	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
+	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 )
 
 func TestProxyUpdatePolicy(t *testing.T) {
@@ -119,29 +122,173 @@ func TestForwardAddsEDNS0BufferSize(t *testing.T) {
 	query := new(dns.Msg)
 	query.SetQuestion("example.com.", dns.TypeA)
 
-	resp, err := proxy.forward(query)
+	resp, failure, err := proxy.forward(query)
 	require.NoError(t, err)
+	require.Empty(t, failure, "a successful forward must not report a failure reason")
 	require.Len(t, resp.Answer, 1)
 	require.Equal(t, uint16(4096), <-seen)
+}
+
+// A failed lookup has to be classifiable: serveDNS turns the reason into the
+// egress.dns.query.failed_total attribute, which is the only signal an operator gets that
+// resolution is broken rather than merely denied by policy.
+func TestForwardClassifiesFailures(t *testing.T) {
+	t.Run("no upstreams configured", func(t *testing.T) {
+		proxy := &Proxy{upstreamExchangeTimeout: time.Second}
+		query := new(dns.Msg)
+		query.SetQuestion("example.com.", dns.TypeA)
+
+		resp, failure, err := proxy.forward(query)
+
+		require.Error(t, err)
+		require.Nil(t, resp)
+		require.Equal(t, telemetry.DNSFailureNoUpstreams, failure)
+	})
+
+	t.Run("every upstream unreachable", func(t *testing.T) {
+		// Exempt loopback so the dialer skips SO_MARK: without CAP_NET_ADMIN it fails with
+		// EPERM, which would classify as upstream_error for the wrong reason.
+		t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+		resetNameserverExemptCache(t)
+
+		// Port 1 on loopback: nothing listens, so the exchange fails rather than timing out.
+		proxy := &Proxy{
+			upstreams:               []string{"127.0.0.1:1"},
+			activeUpstreams:         []string{"127.0.0.1:1"},
+			upstreamExchangeTimeout: 200 * time.Millisecond,
+		}
+		query := new(dns.Msg)
+		query.SetQuestion("example.com.", dns.TypeA)
+
+		resp, failure, err := proxy.forward(query)
+
+		require.Error(t, err)
+		require.Nil(t, resp)
+		require.Equal(t, telemetry.DNSFailureUpstreamError, failure)
+	})
+
+	t.Run("upstream answers with a failover rcode", func(t *testing.T) {
+		t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+		resetNameserverExemptCache(t)
+
+		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+
+		server := &dns.Server{
+			PacketConn: conn,
+			Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+				resp := new(dns.Msg)
+				resp.SetRcode(r, dns.RcodeServerFailure)
+				_ = w.WriteMsg(resp)
+			}),
+		}
+		started := make(chan struct{})
+		server.NotifyStartedFunc = func() { close(started) }
+		go func() { _ = server.ActivateAndServe() }()
+		t.Cleanup(func() { _ = server.Shutdown() })
+		<-started
+
+		proxy := &Proxy{
+			upstreams:               []string{conn.LocalAddr().String()},
+			activeUpstreams:         []string{conn.LocalAddr().String()},
+			upstreamExchangeTimeout: time.Second,
+		}
+		query := new(dns.Msg)
+		query.SetQuestion("example.com.", dns.TypeA)
+
+		resp, failure, err := proxy.forward(query)
+
+		require.Error(t, err, "SERVFAIL from the only upstream must exhaust the chain")
+		require.Nil(t, resp)
+		require.Equal(t, telemetry.DNSFailureRcode, failure)
+	})
+}
+
+// failingRespWriter records every reply attempt and always fails the write, so
+// the serveDNS stages can be exercised end to end on their error path.
+type failingRespWriter struct {
+	fakeRespWriter
+	attempts int
+}
+
+func (w *failingRespWriter) WriteMsg(m *dns.Msg) error {
+	w.attempts++
+	return errors.New("simulated reply write failure")
+}
+
+// newFailingWriter returns a writer whose replies always fail, seen from ip.
+func newFailingWriter(ip string) *failingRespWriter {
+	return &failingRespWriter{fakeRespWriter: fakeRespWriter{remote: addrFromIP(ip)}}
+}
+
+// A handled query whose reply write fails used to be indistinguishable from an
+// unhandled one: every WriteMsg error in serveDNS was swallowed (issue #1704).
+// writeReply must attempt the write exactly once on every decision stage so the
+// failure is observable instead of silently lost.
+func TestServeDNSReplyWriteFailuresAreSurfaced(t *testing.T) {
+	newQuery := func() *dns.Msg {
+		q := new(dns.Msg)
+		q.SetQuestion("example.com.", dns.TypeA)
+		return q
+	}
+
+	t.Run("deny", func(t *testing.T) {
+		proxy := &Proxy{
+			effectivePolicy: policy.DefaultDenyPolicy(),
+			userPolicy:      policy.DefaultDenyPolicy(),
+		}
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "deny reply must be attempted exactly once")
+	})
+
+	t.Run("unknown source", func(t *testing.T) {
+		proxy := &Proxy{
+			effectivePolicy: policy.DefaultDenyPolicy(),
+			userPolicy:      policy.DefaultDenyPolicy(),
+		}
+		proxy.SetQueryPolicySelector(func(netip.Addr) *QueryPolicy { return nil })
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "fail-closed reply must be attempted exactly once")
+	})
+
+	t.Run("upstream error", func(t *testing.T) {
+		// Exempt loopback so the dialer skips SO_MARK (see TestForwardClassifiesFailures).
+		t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+		resetNameserverExemptCache(t)
+
+		proxy := &Proxy{
+			upstreams:               []string{"127.0.0.1:1"},
+			activeUpstreams:         []string{"127.0.0.1:1"},
+			upstreamExchangeTimeout: 200 * time.Millisecond,
+		}
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "SERVFAIL reply must be attempted exactly once")
+	})
+
+	t.Run("answer after allow decision", func(t *testing.T) {
+		proxy := selectorProxy(t)
+		allowPol, err := policy.ParsePolicy(`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
+		require.NoError(t, err)
+		proxy.SetQueryPolicySelector(func(netip.Addr) *QueryPolicy {
+			return &QueryPolicy{Policy: allowPol}
+		})
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "answer reply must be attempted exactly once")
+	})
 }
 
 func TestSetOnResolved(t *testing.T) {
 	proxy, err := New(policy.DefaultDenyPolicy(), "", nil, nil)
 	require.NoError(t, err)
-	var called bool
-	var capturedDomain string
-	var capturedIPs []nftables.ResolvedIP
-	proxy.SetOnResolved(func(domain string, ips []nftables.ResolvedIP) {
-		called = true
-		capturedDomain = domain
-		capturedIPs = ips
-	})
+	proxy.SetOnResolved(func(_ string, _ []nftables.ResolvedIP) {})
 	require.NotNil(t, proxy.onResolved, "SetOnResolved did not set callback")
 	proxy.SetOnResolved(nil)
 	require.Nil(t, proxy.onResolved, "SetOnResolved(nil) did not clear callback")
-	_ = called
-	_ = capturedDomain
-	_ = capturedIPs
 }
 
 func TestMaybeNotifyResolved_CallsCallbackWhenAOrAAAA(t *testing.T) {

@@ -156,7 +156,7 @@ class K8sClient:
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.update_cache(obj)
+            informer.invalidate()
         return obj
 
     def get_custom_object(
@@ -173,8 +173,8 @@ class K8sClient:
         Returns None on 404.
         """
         informer = self._get_informer(group, version, plural, namespace)
-        if informer and informer.has_synced:
-            cached = informer.get(name)
+        if informer:
+            cached = informer.get_if_synced(name)
             if cached is not None:
                 return cached
 
@@ -188,8 +188,8 @@ class K8sClient:
                 plural=plural,
                 name=name,
             )
-            if informer:
-                informer.update_cache(obj)
+            if not isinstance(obj, dict):
+                raise TypeError("Custom object GET returned a non-dict response")
             return obj
         except ApiException as e:
             if e.status == 404:
@@ -211,17 +211,18 @@ class K8sClient:
         a direct API call (with rate limiting) otherwise.
         """
         informer = self._get_informer(group, version, plural, namespace)
-        if informer and informer.has_synced:
+        if informer:
             terms = parse_selector(label_selector)
             if terms is not None:
-                cached = informer.list()
-                if not terms:
-                    return cached
-                return [
-                    obj
-                    for obj in cached
-                    if matches(obj.get("metadata", {}).get("labels") or {}, terms)
-                ]
+                cached = informer.list_if_synced()
+                if cached is not None:
+                    if not terms:
+                        return cached
+                    return [
+                        obj
+                        for obj in cached
+                        if matches(obj.get("metadata", {}).get("labels") or {}, terms)
+                    ]
 
         if self._read_limiter:
             self._read_limiter.acquire()
@@ -261,7 +262,7 @@ class K8sClient:
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.delete_from_cache(name)
+            informer.invalidate()
 
     def patch_custom_object(
         self,
@@ -285,7 +286,7 @@ class K8sClient:
         )
         informer = self._lookup_informer(group, version, plural, namespace)
         if informer:
-            informer.update_cache(obj)
+            informer.invalidate()
         return obj
 
     # ------------------------------------------------------------------
@@ -365,16 +366,30 @@ class K8sClient:
 
         The pinned kubernetes-client picks ``application/json-patch+json`` by
         default (first entry in the generated content-type list) which would
-        reject our merge-shaped body. Force strategic-merge so list fields
-        like ``ownerReferences`` merge by key.
+        reject our merge-shaped body. Its generated high-level method does not
+        accept a content-type override, so use the underlying ``ApiClient`` to
+        preserve strategic-merge semantics for list fields like
+        ``ownerReferences``.
         """
         if self._write_limiter:
             self._write_limiter.acquire()
-        return self.get_core_v1_api().patch_namespaced_persistent_volume_claim(
-            name=name,
-            namespace=namespace,
+        api_client = self.get_core_v1_api().api_client
+        return api_client.call_api(
+            "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{name}",
+            "PATCH",
+            path_params={"namespace": namespace, "name": name},
+            query_params=[],
+            header_params={
+                "Accept": "application/json",
+                "Content-Type": "application/strategic-merge-patch+json",
+            },
             body=body,
-            _content_type="application/strategic-merge-patch+json",
+            post_params=[],
+            files={},
+            response_type="V1PersistentVolumeClaim",
+            auth_settings=["BearerToken"],
+            _return_http_data_only=True,
+            collection_formats={},
         )
 
     # ------------------------------------------------------------------
@@ -404,6 +419,20 @@ class K8sClient:
             label_selector=label_selector,
         )
         return resp.items
+
+    def read_pod(self, namespace: str, name: str) -> Any | None:
+        """Read a Pod by name, returning None when it no longer exists."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            return self.get_core_v1_api().read_namespaced_pod(
+                namespace=namespace,
+                name=name,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
 
     def read_runtime_class(self, name: str) -> Any:
         """Read a RuntimeClass from the cluster."""
