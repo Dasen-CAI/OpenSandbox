@@ -207,6 +207,8 @@ Response:
 }
 ```
 
+**Resource limits**: The request above limits the sandbox to 0.5 CPU cores (`500m`) and 512 MiB of memory (`512Mi`). With the Docker runtime, invalid CPU or memory limits return HTTP 400 (`INVALID_PARAMETER`).
+
 **Other lifecycle calls** (same `OPEN-SANDBOX-API-KEY` header): `GET /v1/sandboxes/{id}`, `POST /v1/sandboxes/{id}/pause`, `POST /v1/sandboxes/{id}/resume`, `GET /v1/sandboxes/{id}/endpoints/{port}` (append `?use_server_proxy=true` when needed), `POST .../renew-expiration`, `DELETE /v1/sandboxes/{id}`. Full request/response shapes: **Swagger UI** above or OpenAPI under [specs/](/api/).
 
 When a server-proxied HTTP route cannot connect to the selected sandbox backend,
