@@ -2245,8 +2245,19 @@ async def test_create_sandbox_windows_profile_rejects_missing_runtime_devices(mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "limits, field",
+    [
+        ({"cpu": "1"}, "cpu"),
+        ({"memory": "3 G"}, "memory"),
+        ({"disk": "63G"}, "disk"),
+        ({"memory": "invalid"}, "memory"),
+    ],
+)
 @patch("opensandbox_server.services.docker.docker_service.docker")
-async def test_create_sandbox_windows_profile_rejects_below_minimum_resource_limits(mock_docker):
+async def test_create_sandbox_windows_profile_rejects_invalid_resource_limits_before_side_effects(
+    mock_docker, limits, field
+):
     mock_client = MagicMock()
     mock_client.containers.list.return_value = []
     mock_docker.from_env.return_value = mock_client
@@ -2257,7 +2268,7 @@ async def test_create_sandbox_windows_profile_rejects_below_minimum_resource_lim
     service = DockerSandboxService(config=cfg)
     request = CreateSandboxRequest(
         image=ImageSpec(uri="dockurr/windows:latest"),
-        resourceLimits=ResourceLimits(root={"cpu": "1", "memory": "2G", "disk": "32G"}),
+        resourceLimits=ResourceLimits(root=limits),
         entrypoint=["cmd", "/c", "echo ready"],
         platform=PlatformSpec(os="windows", arch="amd64"),
     )
@@ -2266,6 +2277,8 @@ async def test_create_sandbox_windows_profile_rejects_below_minimum_resource_lim
             "opensandbox_server.services.docker.docker_service.validate_windows_runtime_prerequisites",
             return_value=None,
         ),
+        patch.object(service, "_validate_volumes") as validate_volumes,
+        patch.object(service, "_ensure_image_available") as ensure_image,
         patch.object(service, "_create_and_start_container") as mock_create,
         pytest.raises(HTTPException) as exc_info,
     ):
@@ -2273,13 +2286,17 @@ async def test_create_sandbox_windows_profile_rejects_below_minimum_resource_lim
 
     assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
     assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
-    assert "resourceLimits.cpu >= 2" in exc_info.value.detail["message"]
+    assert f"resourceLimits.{field}" in exc_info.value.detail["message"]
+    validate_volumes.assert_not_called()
+    ensure_image.assert_not_called()
+    mock_client.volumes.create.assert_not_called()
     mock_create.assert_not_called()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("memory, expected_ram", [("8G", "8G"), ("4 G", "4G"), ("4096 Mi", "4G")])
 @patch("opensandbox_server.services.docker.docker_service.docker")
-async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(mock_docker):
+async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(mock_docker, memory, expected_ram):
     """
     Use a dockur/windows-style request payload (VERSION env) and verify
     it is forwarded through the windows profile create path.
@@ -2297,7 +2314,7 @@ async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(m
         resourceLimits=ResourceLimits(
             root={
                 "cpu": "4",
-                "memory": "8G",
+                "memory": memory,
                 "disk": "64G",
             }
         ),
@@ -2325,11 +2342,12 @@ async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(m
     host_config_kwargs = mock_create.call_args.args[5]
     assert "VERSION=11" in forwarded_env
     assert "CPU_CORES=4" in forwarded_env
-    assert "RAM_SIZE=8G" in forwarded_env
+    assert f"RAM_SIZE={expected_ram}" in forwarded_env
     assert "DISK_SIZE=64G" in forwarded_env
     assert "USER_PORTS=44772,8080,3389,8006" in forwarded_env
     assert "mem_limit" not in host_config_kwargs
     assert "nano_cpus" not in host_config_kwargs
+    assert "device_requests" not in host_config_kwargs
     assert response.platform is not None
     assert response.platform.os == "windows"
     assert response.platform.arch == "amd64"

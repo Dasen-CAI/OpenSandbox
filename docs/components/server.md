@@ -156,8 +156,6 @@ curl -H "OPEN-SANDBOX-API-KEY: your-secret-api-key" http://localhost:8080/v1/san
 
 ### Example Usage
 
-Docker requires positive `resourceLimits.cpu` and `resourceLimits.memory` values; `gpu` accepts a positive integer or `all`. Invalid values return HTTP 400 (`INVALID_PARAMETER`) before volume creation or image pulls. Correct previously ignored values or omit the key to leave that limit unset.
-
 **Create a Sandbox**
 
 ```bash
@@ -208,6 +206,8 @@ Response:
   "entrypoint": ["python", "-m", "http.server", "8000"]
 }
 ```
+
+**Resource limits**: The request above limits the sandbox to 0.5 CPU cores (`500m`) and 512 MiB of memory (`512Mi`). With the Docker runtime, invalid CPU or memory limits return HTTP 400 (`INVALID_PARAMETER`).
 
 **Other lifecycle calls** (same `OPEN-SANDBOX-API-KEY` header): `GET /v1/sandboxes/{id}`, `POST /v1/sandboxes/{id}/pause`, `POST /v1/sandboxes/{id}/resume`, `GET /v1/sandboxes/{id}/endpoints/{port}` (append `?use_server_proxy=true` when needed), `POST .../renew-expiration`, `DELETE /v1/sandboxes/{id}`. Full request/response shapes: **Swagger UI** above or OpenAPI under [specs/](/api/).
 
