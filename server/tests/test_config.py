@@ -1073,6 +1073,10 @@ def test_egress_config_empty_otlp_endpoint_normalizes_to_none():
         "grpc://otel-collector:4317",
         "otel-collector.observability:4318",
         "unix:///var/run/otel.sock",
+        "http://",
+        "https://",
+        "http:///v1/metrics",
+        "https:///v1/metrics",
     ],
 )
 def test_egress_config_rejects_non_http_otlp_endpoint(endpoint):

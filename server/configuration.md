@@ -231,7 +231,8 @@ image = "opensandbox/egress:v1.1.7"
 requests = { cpu = "25m", memory = "64Mi" }
 limits = { cpu = "250m", memory = "256Mi" }
 # Optional: export the egress sidecar's OpenTelemetry metrics to an OTLP/HTTP collector.
-# otlp_endpoint = "http://otel-collector.observability:4318"
+# Use a fully qualified service name or an IP (see below).
+# otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
 ```
 
 Requests and limits can be omitted independently. Invalid or negative Kubernetes resource quantities cause configuration loading to fail. When both settings are omitted, the egress container does not declare resources and namespace `LimitRange` defaults may apply.
@@ -240,8 +241,9 @@ Requests and limits can be omitted independently. Invalid or negative Kubernetes
 
 When `otlp_endpoint` is configured, the server injects it into every egress sidecar as `OTEL_EXPORTER_OTLP_ENDPOINT` (both Docker and Kubernetes). Notes:
 
-- The endpoint **must** use `http://` or `https://` — the sidecar's telemetry client only supports OTLP over HTTP/protobuf; a gRPC endpoint (port 4317) silently won't work.
+- The endpoint **must** use `http://` or `https://` with a collector host — the sidecar's telemetry client only supports OTLP over HTTP/protobuf; a gRPC endpoint (port 4317) or a host-less URL silently won't work.
 - The value is infrastructure config: it is read only from the server config file and is not settable through the create API or per-request `env`.
+- Use a **fully qualified service name or an IP** (e.g. `otel-collector.observability.svc.cluster.local` on Kubernetes). The sidecar's automatic egress allow rule matches the configured host exactly, while the resolver expands partial service names (e.g. `otel-collector.observability`) to FQDNs the rule does not match, so telemetry would be blocked under a default-deny policy.
 - The sidecar exports **delta** temporality; a collector feeding Prometheus/GMP needs the `deltatocumulative` processor.
 
 ### IPv6 and egress

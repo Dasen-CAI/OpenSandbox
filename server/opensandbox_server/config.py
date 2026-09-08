@@ -28,6 +28,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
+from urllib.parse import urlparse
 
 from kubernetes.utils.quantity import parse_quantity
 from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
@@ -857,10 +858,12 @@ class EgressConfig(BaseModel):
     def validate_otlp_endpoint(cls, endpoint: Optional[str]) -> Optional[str]:
         if not endpoint:
             return None
-        if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError(
-                "otlp_endpoint must be an http(s) URL: "
-                "the egress sidecar telemetry client only supports OTLP over HTTP"
+                "otlp_endpoint must be an http(s) URL with a collector host: "
+                "the egress sidecar telemetry client only supports OTLP over HTTP "
+                "and rejects endpoints without a hostname"
             )
         return endpoint
 
