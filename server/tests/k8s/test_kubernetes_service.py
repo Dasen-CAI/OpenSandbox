@@ -363,6 +363,7 @@ class TestKubernetesSandboxServiceCreate:
             image="opensandbox/egress:v1.1.7",
             disable_ipv6=False,
             requests={"cpu": "25m"},
+            otlp_endpoint="http://otel-collector.observability:4318",
         )
         k8s_service.workload_provider.create_workload.return_value = {
             "name": "test-id", "uid": "uid-1"
@@ -388,6 +389,9 @@ class TestKubernetesSandboxServiceCreate:
         assert egress_settings.disable_ipv6 is False
         assert egress_settings.resource_requests == {"cpu": "25m"}
         assert egress_settings.resource_limits is None
+        assert (
+            egress_settings.otlp_endpoint == "http://otel-collector.observability:4318"
+        )
         assert egress_settings.env == {"OPENSANDBOX_EGRESS_LOG_LEVEL": "debug"}
         assert kwargs["env"] == {"SANDBOX_ENV": "value"}
         assert "network_policy" not in kwargs
